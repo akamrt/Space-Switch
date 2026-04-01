@@ -1,1535 +1,1439 @@
-"""
-Space Switch Dashboard for Maya 2023
-=====================================
-An animator-focused dashboard for space switching with anti-gimbal lock features.
-
-USAGE:
-    Copy and paste this entire script into Maya's Script Editor and run.
-    The dashboard will appear as a dockable window.
-
-THREE-STAGE WORKFLOW:
-    1. CREATE  - Build locator hierarchy and position from current frame
-    2. BAKE    - Bake animation to locators with cleanup
-    3. REBUILD - Apply constraints back to original objects
-
-Auto-reloads when re-run for fast iteration during development.
-"""
-
-# ============================================================================
-# AUTO-RELOAD FOR FAST ITERATION
-# ============================================================================
-import sys
-
-_MODULE_NAME = "space_switch_dashboard"
-if _MODULE_NAME in sys.modules:
-    del sys.modules[_MODULE_NAME]
-
-# ============================================================================
-# IMPORTS
-# ============================================================================
 import maya.cmds as cmds
-import maya.mel as mel
 import maya.api.OpenMaya as om
-import math
-from functools import partial
+import random
+import time
 
-# ============================================================================
-# CONSTANTS
-# ============================================================================
-WINDOW_NAME = "spaceSwitchDashboard"
-WINDOW_TITLE = "Space Switch Dashboard"
+try:
+    from PySide6 import QtWidgets, QtCore, QtGui
+except ImportError:
+    from PySide2 import QtWidgets, QtCore, QtGui
+
+# --- CONSTANTS ---
+WINDOW_TITLE = "SPACE.SWITCH // DASHBOARD"
+WINDOW_NAME = "ss_dashboard_window"
 LOCATOR_SUFFIX = "_SS_loc"
 OFFSET_SUFFIX = "_offset"
-GIMBAL_SUFFIX = "_gimbal"
 
-# Color palette for locators (Maya override colors)
 LOCATOR_COLORS = {
-    "red": 13,
-    "yellow": 17,
-    "green": 14,
-    "blue": 6,
-    "purple": 9,
-    "white": 16,
-    "cyan": 18,
-    "orange": 21,
+    "red": 13, "yellow": 17, "green": 14, "blue": 6,
+    "purple": 9, "white": 16, "cyan": 18, "orange": 21
 }
 
-ROTATION_ORDERS = ["xyz", "yzx", "zxy", "xzy", "yxz", "zyx"]
+UI_COLORS = {
+    "red": "#ff4444", "yellow": "#eab308", "green": "#55ff55",
+    "blue": "#55aaff", "purple": "#a855f7", "white": "#f8fafc",
+    "cyan": "#00f3ff", "orange": "#f6a226"
+}
 
+# --- QSS STYLESHEET ---
+QSS = """
+QWidget {
+    background-color: #05060a; 
+    color: #e0e7ff; 
+    font-family: "Consolas", "Courier New", monospace; 
+    font-size: 10px;
+}
+QMainWindow { background-color: #05060a; }
 
-# ============================================================================
+/* Scrollbars */
+QScrollArea { border: none; background: transparent; }
+QScrollBar:vertical { background: #05060a; width: 6px; border: none; }
+QScrollBar::handle:vertical { background: rgba(0, 243, 255, 0.2); min-height: 20px; border-radius: 3px; }
+QScrollBar::handle:vertical:hover { background: rgba(0, 243, 255, 0.4); }
+
+/* Panels */
+QFrame#HudPanel {
+    background: rgba(10, 12, 18, 0.9);
+    border: 1px solid rgba(0, 243, 255, 0.15);
+    border-radius: 2px;
+}
+
+/* Headers */
+QPushButton#GroupLabel {
+    background: transparent;
+    color: rgba(255, 255, 255, 0.2);
+    text-align: left;
+    border: none;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    font-size: 10px;
+    letter-spacing: 2px;
+    padding: 2px 0px;
+    margin-top: 2px;
+}
+QPushButton#GroupLabel:hover {
+    color: #00f3ff;
+    border-bottom: 1px solid rgba(0, 243, 255, 0.5);
+}
+QPushButton#GroupLabel:pressed {
+    padding: 2px 0px; 
+    background: transparent;
+    color: #00f3ff;
+}
+
+/* General Buttons */
+QPushButton {
+    background-color: rgba(0, 243, 255, 0.03); 
+    border: 1px solid rgba(0, 243, 255, 0.2);
+    color: #00f3ff; 
+    padding: 3px 6px; 
+    font-family: "Consolas", monospace; 
+    font-size: 9px;
+    text-transform: uppercase; 
+    letter-spacing: 1px;
+}
+QPushButton:hover { background-color: rgba(0, 243, 255, 0.15); }
+QPushButton:pressed {
+    padding-top: 5px; padding-bottom: 1px;
+    background-color: rgba(0, 243, 255, 0.3);
+}
+
+/* Mode Buttons Specific Styling */
+QPushButton#ModeBtn {
+    color: rgba(0, 243, 255, 0.3);
+    border-color: rgba(0, 243, 255, 0.15);
+    background-color: transparent;
+}
+QPushButton#ModeBtn:hover {
+    color: rgba(0, 243, 255, 0.7);
+    border-color: rgba(0, 243, 255, 0.4);
+    background-color: rgba(0, 243, 255, 0.05);
+}
+QPushButton#ModeBtn:checked {
+    background-color: rgba(0, 243, 255, 0.25);
+    border-color: #00f3ff;
+    color: #ffffff;
+    font-weight: bold;
+    padding-top: 5px; padding-bottom: 1px; /* Impressed look */
+}
+
+/* Custom Action Buttons */
+QPushButton#ActionPrimary { border-color: rgba(0, 243, 255, 0.5); font-size: 11px; padding: 6px; }
+QPushButton#ActionPrimary:pressed { padding-top: 8px; padding-bottom: 4px; background-color: rgba(0, 243, 255, 0.25); }
+
+QPushButton#ActionOrange { border-color: rgba(246, 162, 38, 0.5); color: #f6a226; font-size: 11px; padding: 6px; }
+QPushButton#ActionOrange:hover { background: rgba(246, 162, 38, 0.15); }
+QPushButton#ActionOrange:pressed { padding-top: 8px; padding-bottom: 4px; background-color: rgba(246, 162, 38, 0.3); }
+
+QPushButton#Danger { border-color: rgba(255, 68, 68, 0.5); color: #ff4444; }
+QPushButton#Danger:hover { background: rgba(255, 68, 68, 0.15); }
+QPushButton#Danger:pressed { padding-top: 5px; padding-bottom: 1px; background-color: rgba(255, 68, 68, 0.3); }
+
+/* --------------------------------------------------------
+   HOVER ANIMATIONS (Pulse / Glitch Properties) 
+   -------------------------------------------------------- */
+
+QPushButton[flicker="g1"] { background-color: rgba(255,255,255,0.1); border: 1px dashed white; color: white; }
+QPushButton[flicker="g2"] { background-color: transparent; border: 1px dotted #00f3ff; color: #00f3ff; }
+
+QPushButton[flicker="p1"] { background-color: rgba(0, 243, 255, 0.15); border: 1px solid rgba(0, 243, 255, 0.8); }
+QPushButton[flicker="p2"] { background-color: rgba(0, 243, 255, 0.05); border: 1px solid rgba(0, 243, 255, 0.3); }
+
+QPushButton#ActionOrange[flicker="p1"] { background-color: rgba(246, 162, 38, 0.2); border-color: #f6a226; color: white; }
+QPushButton#ActionOrange[flicker="p2"] { background-color: rgba(246, 162, 38, 0.05); border-color: rgba(246, 162, 38, 0.4); }
+
+QPushButton#Danger[flicker="p1"] { background-color: rgba(255, 68, 68, 0.2); border-color: #ff4444; color: white; }
+QPushButton#Danger[flicker="p2"] { background-color: rgba(255, 68, 68, 0.05); border-color: rgba(255, 68, 68, 0.4); }
+
+/* ToggleBtn Logic */
+QPushButton#ToggleBtn {
+    text-align: left;
+    font-weight: bold;
+    border-radius: 2px;
+}
+QPushButton#ToggleBtn:pressed { padding-top: 5px; padding-bottom: 1px; }
+
+QPushButton#ToggleBtn[toggle_state="on"] {
+    background-color: rgba(85, 255, 85, 0.1); border: 1px solid rgba(85, 255, 85, 0.6); color: #55ff55;
+}
+QPushButton#ToggleBtn[toggle_state="off"] {
+    background-color: rgba(255, 68, 68, 0.05); border: 1px solid rgba(255, 68, 68, 0.4); color: #ff4444;
+}
+
+QPushButton#ToggleBtn[toggle_state="on"][flicker="p1"] { background-color: rgba(85, 255, 85, 0.25); border-color: white; color: white; }
+QPushButton#ToggleBtn[toggle_state="on"][flicker="p2"] { background-color: rgba(85, 255, 85, 0.15); border-color: #55ff55; }
+QPushButton#ToggleBtn[toggle_state="off"][flicker="p1"] { background-color: rgba(255, 68, 68, 0.2); border-color: white; color: white; }
+QPushButton#ToggleBtn[toggle_state="off"][flicker="p2"] { background-color: rgba(255, 68, 68, 0.1); border-color: #ff4444; }
+
+/* Individual Button Flash States */
+QPushButton[flash_color="red"] {
+    background-color: rgba(255, 68, 68, 0.8) !important;
+    color: white !important;
+    border: 1px solid #ff4444 !important;
+}
+
+QPushButton[flash_color="green"] {
+    background-color: rgba(85, 255, 85, 0.8) !important;
+    color: black !important;
+    border: 1px solid #55ff55 !important;
+}
+
+QPushButton[flash_color="white"] {
+    background-color: rgba(255, 255, 255, 0.9) !important;
+    color: black !important;
+    border: 1px solid white !important;
+}
+
+/* Click Flash Overrides (Absolute highest priority) */
+QPushButton[flashing="true"], QFrame[flashing="true"], QLineEdit[flashing="true"] {
+    background-color: white !important;
+    color: black !important;
+    border: 1px solid white !important;
+}
+
+/* Text Input Boxes */
+QLineEdit { 
+    background-color: rgba(30, 35, 45, 0.9); 
+    border: 1px solid rgba(0, 243, 255, 0.4); 
+    color: #00f3ff; 
+    padding: 4px 8px; 
+    margin: 0px 2px;
+    border-radius: 2px;
+}
+QLineEdit:focus { border-color: #00f3ff; background-color: rgba(40, 45, 55, 1.0); }
+
+QLineEdit#SourceInput { 
+    color: #f6a226; 
+    border-color: rgba(246, 162, 38, 0.4); 
+}
+QLineEdit#SourceInput:focus { border-color: #f6a226; }
+
+QLineEdit#TargetInput { 
+    color: #ff3300; 
+    border-color: rgba(255, 51, 0, 0.4); 
+}
+QLineEdit#TargetInput:focus { border-color: #ff3300; }
+
+/* Spin Boxes & ComboBoxes */
+QDoubleSpinBox, QSpinBox { 
+    background-color: rgba(0,0,0,0.6); border: 1px solid rgba(0,243,255,0.15); color: #00f3ff; padding: 4px; 
+}
+QDoubleSpinBox:focus, QSpinBox:focus { border-color: rgba(0,243,255,0.4); }
+
+QComboBox { 
+    background-color: rgba(5,8,15,0.9); border: 1px solid rgba(0,243,255,0.15); color: #00f3ff; padding: 4px; 
+}
+QComboBox::drop-down { border: none; width: 14px; }
+QComboBox QAbstractItemView { 
+    background: #0a0c12; color: #00f3ff; selection-background-color: rgba(0,243,255,0.15); 
+}
+
+/* Slider */
+QSlider::groove:horizontal { border: none; height: 2px; background: rgba(255, 0, 234, 0.2); }
+QSlider::handle:horizontal { background: #ff00ea; width: 6px; height: 14px; margin: -6px 0; }
+"""
+
+# ==============================================================================
 # SPACE SWITCHER CORE LOGIC
-# ============================================================================
+# ==============================================================================
+
 class SpaceSwitcher:
-    """Core logic for space switching operations."""
-    
     def __init__(self):
         self.created_locators = []
-        self.source_objects = []
         self.temp_constraints = []
 
-    def get_best_rotation_order(self, source_obj, start_time, end_time):
-        """
-        Calculate the best rotation order to minimize gimbal lock.
-        Analyzes the source object's world rotation over the time range.
-        Middle axis approaching +/- 90 degrees is bad.
-        """
-        if not cmds.objExists(source_obj):
-            return 0 # Default xyz
-
-        # Valid orders in Maya which map to MTransformationMatrix constants
-        # 0: kXYZ, 1: kYZX, 2: kZXY, 3: kXZY, 4: kYXZ, 5: kZYX
-        # Middle axes corresponding to these orders:
-        # 0 (xyz) -> Y (1)
-        # 1 (yzx) -> Z (2)
-        # 2 (zxy) -> X (0)
-        # 3 (xzy) -> Z (2)
-        # 4 (yxz) -> X (0)
-        # 5 (zyx) -> Y (1)
-        middle_axis_map = {0: 1, 1: 2, 2: 0, 3: 2, 4: 0, 5: 1}
-        
-        # Map Maya's attribute integers (0-5) to OpenMaya MTransformationMatrix constants
-        # Note: In API 2.0, kXYZ is 1, not 0. 0 is kInvalid.
-        om_order_map = {
-            0: om.MTransformationMatrix.kXYZ,
-            1: om.MTransformationMatrix.kYZX,
-            2: om.MTransformationMatrix.kZXY,
-            3: om.MTransformationMatrix.kXZY,
-            4: om.MTransformationMatrix.kYXZ,
-            5: om.MTransformationMatrix.kZYX
-        }
-        
-        # Track the max deviation (score) for each order. 
-        # Score = Max value of abs(middle_axis_angle). Lower is better (further from 90 deg/1.57 rad).
-        scores = {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.0}
-        
-        # Sample frames
-        frames = range(int(start_time), int(end_time) + 1)
-        
-        print(f"Analyzing {len(frames)} frames for best rotation order on '{source_obj}'...")
-
-        for t in frames:
-            try:
-                # Get World Matrix at frame t
-                mat_list = cmds.getAttr(f"{source_obj}.worldMatrix[0]", time=t)
-                mat = om.MMatrix(mat_list)
-                
-                for order_idx, middle_axis_idx in middle_axis_map.items():
-                    # Create a transformation matrix from the world matrix
-                    tm = om.MTransformationMatrix(mat)
-                    
-                    # Reorder to the target rotation order to see what the curves would look like
-                    # use mapped constant, not the 0-5 index directly
-                    tm.reorderRotation(om_order_map[order_idx])
-                    
-                    # Get the Euler rotation
-                    euler = tm.rotation()
-                    
-                    # Check the value of the middle axis (radians)
-                    mid_val = abs(euler[middle_axis_idx])
-                    
-                    # We want to minimize the worst-case (highest) value of the middle axis
-                    # closer to 0 is better. closer to PI/2 (1.57) is bad.
-                    if mid_val > scores[order_idx]:
-                        scores[order_idx] = mid_val
-                        
-            except Exception as e:
-                print(f"Error analyzing frame {t}: {e}")
-                continue
-
-        # Find order with lowest max deviation
-        best_order = min(scores, key=scores.get)
-        
-        # Debug Output
-        print("Rotation Order Scores (Lower max deviation is better):")
-        for order_idx, score in scores.items():
-            mark = " [BEST]" if order_idx == best_order else ""
-            print(f"  {ROTATION_ORDERS[order_idx].upper()}: Max Middle Axis = {math.degrees(score):.2f} deg{mark}")
-            
-        print(f"Selected Best Order: {ROTATION_ORDERS[best_order].upper()}")
-        return best_order
-
-    
-    def create_locator_hierarchy(self, source_obj, target_obj=None, mode="world", 
-                                  num_offsets=2, locator_size=1, 
-                                  color_index=17, rotation_order=0, hide_offset=True):
-        """
-        Create locator hierarchy with Master Space node.
-        Hierarchy: Master(Space) -> Top_Offset(Baked) -> [Gimbal] -> Locator(Control)
-        """
-        if not source_obj:
-            return None, None, None
-            
-        base_name = source_obj.replace(":", "_").replace("|", "_")
-        
-        # 1. Create MASTER Group (The Space Node)
-        master_name = f"{base_name}_Master_Space"
-        master_grp = cmds.group(empty=True, name=master_name)
-        cmds.setAttr(f"{master_grp}.rotateOrder", rotation_order)
-        
-        # Setup Master Space transform/constraints
-        if mode == "world":
-            # World space: Master stays at origin (Identity)
-            pass 
-        elif mode == "local":
-             # Local space: Match Source Initial
-             cmds.matchTransform(master_grp, source_obj, position=True, rotation=True)
-             
-        elif mode in ["object", "camera", "aim"]:
-            # These modes REQUIRE a target
-            if not target_obj or not cmds.objExists(target_obj):
-                cmds.warning(f"Create Hierarchy: Target '{target_obj}' invalid for mode '{mode}'. Master staying at origin.")
-            else:
-                # Match Target Pivot first
-                cmds.matchTransform(master_grp, target_obj, position=True, rotation=True)
-                
-                # Apply Space Constraints
-                if mode == "object":
-                    # STRICT SNAP to target (False) ensuring we adopt its space exactly
-                    cmds.parentConstraint(target_obj, master_grp, maintainOffset=False)
-                elif mode == "camera":
-                    cmds.parentConstraint(target_obj, master_grp, maintainOffset=False)
-                elif mode == "aim":
-                    # Aim Space: Master positioned at Target, Aiming at Source.
-                    # Static setup: Constraints are applied and then deleted immediately so Master is static.
-                    cmds.matchTransform(master_grp, target_obj, position=True)
-                    
-                    # Aim at Source (X-axis)
-                    ac = cmds.aimConstraint(source_obj, master_grp, maintainOffset=False, 
-                                       aimVector=(1,0,0), upVector=(0,1,0), worldUpType="scene")
-                    cmds.delete(ac)
-
-        # 2. Create Locator Chain (Child of Master)
-        # Create the main control locator (bottom of chain)
-        locator_name = base_name + LOCATOR_SUFFIX
-        locator = cmds.spaceLocator(name=locator_name)[0]
-        
-        # Set locator visuals
-        cmds.setAttr(f"{locator}.localScaleX", locator_size)
-        cmds.setAttr(f"{locator}.localScaleY", locator_size)
-        cmds.setAttr(f"{locator}.localScaleZ", locator_size)
-        locator_shape = cmds.listRelatives(locator, shapes=True)[0]
-        cmds.setAttr(f"{locator_shape}.overrideEnabled", 1)
-        cmds.setAttr(f"{locator_shape}.overrideColor", color_index)
-        cmds.setAttr(f"{locator}.rotateOrder", rotation_order)
-        # Expose rotateOrder in Channel Box
-        cmds.setAttr(f"{locator}.rotateOrder", k=True)
-        # Hide the bottom child locator — it's a technical driver, not an animator handle
-        if hide_offset:
-            cmds.setAttr(f"{locator_shape}.visibility", 0)
-        
-        # Build offset hierarchy strictly above locator
-        current_child = locator
-        top_offset = locator
-        
-        for i in range(num_offsets):
-            offset_name = f"{base_name}{OFFSET_SUFFIX}_{i+1}"
-            if i == 0:
-                offset_name = f"{base_name}{GIMBAL_SUFFIX}"
-            
-            is_top_offset = (i == num_offsets - 1)
-            
-            if is_top_offset:
-                # The top offset holds the baked animation
-                offset_grp = cmds.spaceLocator(name=offset_name)[0]
-                # Expose rotateOrder in Channel Box
-                cmds.setAttr(f"{offset_grp}.rotateOrder", k=True)
-                
-                # Visuals for baked locator
-                top_size = locator_size * 1.2
-                cmds.setAttr(f"{offset_grp}.localScaleX", top_size)
-                cmds.setAttr(f"{offset_grp}.localScaleY", top_size)
-                cmds.setAttr(f"{offset_grp}.localScaleZ", top_size)
-                shape = cmds.listRelatives(offset_grp, shapes=True)[0]
-                cmds.setAttr(f"{shape}.overrideEnabled", 1)
-                cmds.setAttr(f"{shape}.overrideColor", color_index)
-                # Top offset is the animator's baked control — keep it visible
-            else:
-                offset_grp = cmds.group(empty=True, name=offset_name)
-            
-            cmds.setAttr(f"{offset_grp}.rotateOrder", rotation_order)
-            
-            cmds.parent(current_child, offset_grp)
-            current_child = offset_grp
-            top_offset = offset_grp
-            
-        # 3. Parent Chain to Master
-        # Match chain to source object current position BEFORE parenting
-        cmds.matchTransform(top_offset, source_obj, position=True, rotation=True)
-        cmds.parent(top_offset, master_grp)
-        
-        # Store reference
-        self.created_locators.append({
-            "source": source_obj,
-            "locator": locator,
-            "top_group": top_offset, # The one defined as baked target
-            "master": master_grp,
-            "hierarchy": self._get_hierarchy(master_grp)
-        })
-        
-        return top_offset, locator, master_grp
-    
-    def _get_hierarchy(self, top_node):
-        """Get all nodes in the hierarchy."""
-        hierarchy = [top_node]
-        children = cmds.listRelatives(top_node, allDescendents=True, type="transform") or []
-        hierarchy.extend(children)
-        return hierarchy
-    
-    def create_temp_constraints(self, source_obj, target_node, translate=True, rotate=True):
-        """
-        Create temporary constraints from source to target for baking.
-        
-        Args:
-            source_obj: The source object to follow
-            target_node: The node to constrain (should be top_group for proper hierarchy)
-            translate: Apply point constraint
-            rotate: Apply orient constraint
-        """
-        constraints = []
-        
-        if translate:
-            pc = cmds.pointConstraint(source_obj, target_node, maintainOffset=False)[0]
-            constraints.append(pc)
-        
-        if rotate:
-            oc = cmds.orientConstraint(source_obj, target_node, maintainOffset=False)[0]
-            constraints.append(oc)
-        
-        self.temp_constraints.extend(constraints)
-        return constraints
-    
-    def create_aim_constraint(self, source_obj, target_node, aim_target_obj):
-        """
-        Create aim constraint for object space aiming.
-        
-        Args:
-            source_obj: The source object (for reference)
-            target_node: The node to constrain (should be top_group)
-            aim_target_obj: The object to aim at
-        """
-        ac = cmds.aimConstraint(
-            aim_target_obj, target_node,
-            maintainOffset=False,
-            aimVector=(0, 0, 1),
-            upVector=(0, 1, 0),
-            worldUpType="vector",
-            worldUpVector=(0, 1, 0)
-        )[0]
-        self.temp_constraints.append(ac)
-        return ac
-    
-    def bake_animation(self, locators, sample_by=1, euler_filter=True, cleanup_constraints=True, destination_layer=None):
-        """
-        Bake animation to locators.
-        
-        Args:
-            locators: List of locator names to bake
-            sample_by: Sample rate for baking
-            euler_filter: Apply Euler filter after baking
-            cleanup_constraints: Whether to delete temporary constraints
-            destination_layer: Name of animation layer to bake onto (optional)
-        """
-        if not locators:
-            return
-        
-        start_time = cmds.playbackOptions(query=True, minTime=True)
-        end_time = cmds.playbackOptions(query=True, maxTime=True)
-        
-        cmds.refresh(suspend=True)
+    def get_best_rotation_order(self, obj, start, end):
+        om_map = {0: om.MTransformationMatrix.kXYZ, 1: om.MTransformationMatrix.kYZX, 
+                  2: om.MTransformationMatrix.kZXY, 3: om.MTransformationMatrix.kXZY, 
+                  4: om.MTransformationMatrix.kYXZ, 5: om.MTransformationMatrix.kZYX}
+        scores = {i: 0 for i in range(6)}
         try:
-            bake_args = {
-                "simulation": True,
-                "time": (start_time, end_time),
-                "sampleBy": sample_by,
-                "disableImplicitControl": True,
-                "preserveOutsideKeys": True,
-                "sparseAnimCurveBake": True,
-                "removeBakedAttributeFromLayer": False,
-                "removeBakedAnimFromLayer": False,
-                "bakeOnOverrideLayer": False,
-                "minimizeRotation": True,
-                "controlPoints": False
-            }
+            for f in range(int(start), int(end) + 1):
+                tm = om.MTransformationMatrix(om.MMatrix(cmds.getAttr(f"{obj}.worldMatrix[0]", time=f)))
+                for idx, order in om_map.items():
+                    e = tm.asEulerRotation()
+                    e.reorderIt(order)
+                    if abs(e.y) > scores[idx]: scores[idx] = abs(e.y)
+            return min(scores, key=scores.get)
+        except Exception:
+            return 0 
 
-            if destination_layer:
-                bake_args["destinationLayer"] = destination_layer
+    def clean_static_keys(self, nodes, threshold=0.001):
+        curves = cmds.listConnections(nodes, type="animCurve") or []
+        for c in curves:
+            vals = cmds.keyframe(c, q=True, vc=True)
+            if vals and (max(vals) - min(vals)) < threshold: cmds.delete(c)
 
-            cmds.bakeResults(locators, **bake_args)
+    def build_locator_setup(self, source, target, settings):
+        name_base = source.replace(":", "_")
+        master_grp = cmds.group(em=True, n=f"{name_base}_Master_Space")
+        cmds.matchTransform(master_grp, source, pos=True, rot=True)
+        
+        parent = master_grp
+        for i in range(settings["offsets"]):
+            loc = cmds.spaceLocator(n=f"{name_base}{OFFSET_SUFFIX}_{i+1}")[0]
+            cmds.matchTransform(loc, source, pos=True, rot=True)
+            cmds.parent(loc, parent)
+            shape = cmds.listRelatives(loc, shapes=True)[0]
+            cmds.setAttr(f"{shape}.overrideEnabled", 1)
+            cmds.setAttr(f"{shape}.overrideColor", LOCATOR_COLORS.get(settings["color"], 17))
+            s = settings["scale"]
+            cmds.setAttr(f"{loc}.localScale", s, s, s)
+            if settings["hide_offset"]: cmds.setAttr(f"{shape}.visibility", 0)
+            parent = loc
             
-            # Delete temporary constraints
-            if cleanup_constraints:
-                for constraint in self.temp_constraints:
-                    if cmds.objExists(constraint):
-                        cmds.delete(constraint)
-                self.temp_constraints = []
-            
-            # Ensure rotateOrder has no keys (it should be static)
-            for loc in locators:
-                if cmds.objExists(loc):
-                    # Store the correct rotation order value
-                    ro_val = cmds.getAttr(f"{loc}.rotateOrder")
-                    # Remove any keys that might have been baked
-                    cmds.cutKey(loc, attribute="rotateOrder", clear=True)
-                    # Explicitly restore the value to ensure it doesn't revert to default
-                    cmds.setAttr(f"{loc}.rotateOrder", ro_val)
+        main_loc = cmds.spaceLocator(n=f"{name_base}{LOCATOR_SUFFIX}")[0]
+        cmds.matchTransform(main_loc, source, pos=True, rot=True)
+        cmds.parent(main_loc, parent)
+        main_shape = cmds.listRelatives(main_loc, shapes=True)[0]
+        cmds.setAttr(f"{main_shape}.overrideEnabled", 1)
+        cmds.setAttr(f"{main_shape}.overrideColor", LOCATOR_COLORS.get(settings["color"], 17))
+        s = settings["scale"] * 1.2
+        cmds.setAttr(f"{main_loc}.localScale", s, s, s)
+        
+        if settings["add_layer"]:
+            layer_name = "SpaceSwitch_Layer"
+            if not cmds.objExists(layer_name): cmds.createDisplayLayer(name=layer_name, empty=True)
+            cmds.editDisplayLayerMembers(layer_name, master_grp)
+        
+        self.created_locators.extend([master_grp, main_loc])
+        return master_grp, main_loc
 
-            # Apply Euler filter
-            if euler_filter:
-                cmds.select(locators)
-                cmds.filterCurve()
-            
-        finally:
-            cmds.refresh(suspend=False)
-    
-    def cleanup_keys(self, locators, threshold=0.001):
-        """
-        Clean up animation curves:
-        1. Remove redundant keys (linearize holds).
-        2. Remove fully static channels.
-        
-        Args:
-            locators: List of locator names
-            threshold: Tolerance for considering values as static/equal
-        """
-        attrs = ["translateX", "translateY", "translateZ",
-                 "rotateX", "rotateY", "rotateZ",
-                 "scaleX", "scaleY", "scaleZ", "visibility"]
-        
-        for loc in locators:
-            if not cmds.objExists(loc):
-                continue
-                
-            for attr in attrs:
-                attr_path = f"{loc}.{attr}"
-                
-                # Get animation curve
-                anim_curve_list = cmds.listConnections(attr_path, type="animCurve")
-                if not anim_curve_list:
-                    continue
-                
-                anim_curve = anim_curve_list[0]
-                
-                # 1. Remove redundancy (optimize curve)
-                self.remove_redundant_keys(anim_curve, threshold)
-                
-                # 2. Check if remaining curve is static
-                # Get all keyframe values
-                keyframes = cmds.keyframe(anim_curve, query=True, valueChange=True)
-                if not keyframes:
-                    continue
-                
-                # Check if all values are essentially the same
-                min_val = min(keyframes)
-                max_val = max(keyframes)
-                
-                if (max_val - min_val) <= threshold:
-                    # Delete the animation curve (static channel)
-                    cmds.delete(anim_curve)
-
-    def remove_redundant_keys(self, anim_curve, threshold=0.001):
-        """
-        Remove keys that have the same value as their neighbors.
-        """
-        times = cmds.keyframe(anim_curve, query=True, timeChange=True)
-        values = cmds.keyframe(anim_curve, query=True, valueChange=True)
-        
-        if not times or len(times) < 3:
-            return
-            
-        count = len(times)
-        to_delete = []
-        
-        # Iterate from index 1 to count-2
-        for i in range(1, count - 1):
-            prev_val = values[i-1]
-            curr_val = values[i]
-            next_val = values[i+1]
-            
-            # Check if current roughly equals prev AND next
-            if (abs(curr_val - prev_val) <= threshold) and \
-               (abs(curr_val - next_val) <= threshold):
-                to_delete.append(times[i])
-        
-        if to_delete:
-            cmds.cutKey(anim_curve, time=[(t,t) for t in to_delete])
-    
-    def rebuild_constraints(self, translate=True, rotate=True, maintain_offset=False):
-        """
-        Rebuild constraints from locators to source objects.
-        
-        Args:
-            translate: Apply point constraint
-            rotate: Apply orient constraint
-            maintain_offset: Maintain offset in constraints
-        """
-        for loc_data in self.created_locators:
-            source = loc_data["source"]
-            locator = loc_data["locator"]
-            
-            if not cmds.objExists(source) or not cmds.objExists(locator):
-                continue
-            
-            if translate:
-                cmds.pointConstraint(locator, source, maintainOffset=maintain_offset)
-            
-            if rotate:
-                cmds.orientConstraint(locator, source, maintainOffset=maintain_offset)
-    
-    def bake_source_animation(self, sources, sample_by=1, euler_filter=True, 
-                              clean_static=True, threshold=0.001):
-        """
-        Bake down the source objects' animation keys to capture their current 
-        motion (driven by locators), and perform cleanup to remove redundant 
-        or idle keys.
-        """
-        if not sources:
-            return
-            
-        valid_sources = [s for s in sources if cmds.objExists(s)]
-        if not valid_sources:
-            return
-
-        start_time = cmds.playbackOptions(query=True, minTime=True)
-        end_time   = cmds.playbackOptions(query=True, maxTime=True)
-
-        cmds.refresh(suspend=True)
-        try:
-            # Bake the sources based on what's driving them
-            cmds.bakeResults(
-                valid_sources,
-                simulation=True,
-                time=(start_time, end_time),
-                sampleBy=sample_by,
-                disableImplicitControl=True,
-                preserveOutsideKeys=True,
-                sparseAnimCurveBake=False,
-                minimizeRotation=True,
-                controlPoints=False
-            )
-            
-            # Apply Euler filter if requested
-            if euler_filter:
-                cmds.select(valid_sources)
-                cmds.filterCurve()
-                
-            # Clean static/redundant keys on the baked sources
-            if clean_static:
-                self.cleanup_keys(valid_sources, threshold)
-                
-        finally:
-            cmds.refresh(suspend=False)
-            
-        print(f"[SpaceSwitch] Baked and cleaned source animation for {len(valid_sources)} object(s).")
-    
-    def cleanup(self, delete_constraints_first=True):
-        """
-        Clean up locators and constraints.
-        Deletes constraints FIRST to prevent objects popping back.
-        """
-        for loc_data in self.created_locators:
-            source = loc_data["source"]
-            top_group = loc_data["top_group"]
-            master_grp = loc_data.get("master") # Get the master group
-            
-            if delete_constraints_first and cmds.objExists(source):
-                # Delete constraints on source object first
-                self._delete_constraints_on_node(source)
-            
-            # Then delete the locator hierarchy
-            # If we delete the master group, everything below it (top_group, locators) goes too.
-            if master_grp and cmds.objExists(master_grp):
-                cmds.delete(master_grp)
-            elif cmds.objExists(top_group):
-                # Fallback if master not found for some reason
-                cmds.delete(top_group)
-        
+    def cleanup(self):
+        nodes = cmds.ls(f"*{LOCATOR_SUFFIX}", f"*{OFFSET_SUFFIX}*", "*_Master_Space", "SS_Preview_Loc")
+        if nodes: cmds.delete(nodes)
         self.created_locators = []
-    
-    def _delete_constraints_on_node(self, node):
-        """Delete all constraints on a given node."""
-        constraint_types = [
-            "pointConstraint", "orientConstraint", "scaleConstraint",
-            "parentConstraint", "aimConstraint"
+        cmds.inViewMessage(amg="Space Switch Data Cleaned Up.", pos='midCenter', fade=True)
+
+
+# ==============================================================================
+# CUSTOM UI WIDGETS
+# ==============================================================================
+
+class CyberButton(QtWidgets.QPushButton):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+        
+        self._base_text = self.text()
+        
+        # Hover / Pulse Animation Setup
+        self._hover_timer = QtCore.QTimer(self)
+        self._hover_timer.timeout.connect(self._do_flicker)
+        self._hover_timer.setInterval(80)
+        self._hover_ticks = 0
+
+        # Click / Bracket Animation Setup
+        self._click_timer = QtCore.QTimer(self)
+        self._click_timer.timeout.connect(self._animate_click)
+        self._click_step = 0
+
+    def sizeHint(self):
+        hint = super().sizeHint()
+        if not hasattr(self, '_base_text') or not self._base_text:
+            return hint
+            
+        fm = self.fontMetrics()
+        width_func = fm.horizontalAdvance if hasattr(fm, "horizontalAdvance") else fm.width
+        
+        clean_text = self._base_text.replace("\u200B", "").strip()
+        if clean_text.startswith("[") and clean_text.endswith("]"):
+            clean_text = clean_text[1:-1].strip()
+            
+        max_text = f">>> {clean_text} <<<"
+        w = width_func(max_text) + 12 # Reduced padding to keep buttons compact
+        return QtCore.QSize(max(hint.width(), w), hint.height())
+
+    def setText(self, text):
+        self._base_text = text
+        super().setText(text)
+
+    def enterEvent(self, e):
+        super().enterEvent(e)
+        if not self.isEnabled(): return
+        self._hover_ticks = 0
+        self._hover_timer.start()
+
+    def leaveEvent(self, e):
+        super().leaveEvent(e)
+        self._hover_timer.stop()
+        self.setProperty("flicker", "")
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def _do_flicker(self):
+        self._hover_ticks += 1
+        if random.random() > 0.85:
+            state = random.choice(["g1", "g2"])
+        else:
+            state = "p1" if (self._hover_ticks % 8) < 4 else "p2"
+            
+        self.setProperty("flicker", state)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        
+    def mousePressEvent(self, e):
+        super().mousePressEvent(e)
+        self.trigger_flash()
+
+    def trigger_flash(self):
+        self.setProperty("flashing", True)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        
+        self._click_step = 0
+        self._click_timer.start(65)
+        
+    def _animate_click(self):
+        self._click_step += 1
+        
+        if not self._base_text or len(self._base_text) <= 2:
+            if self._click_step > 4:
+                self._click_timer.stop()
+                self.end_flash()
+            return
+            
+        clean_base = self._base_text.replace("\u200B", "").strip()
+        has_brackets = clean_base.startswith("[") and clean_base.endswith("]")
+        inner_text = clean_base[1:-1].strip() if has_brackets else clean_base
+        
+        zws = "\u200B"
+        frames = [
+            f"{zws}  > {inner_text} <  {zws}",
+            f"{zws} >> {inner_text} << {zws}",
+            f"{zws}>>> {inner_text} <<<{zws}",
+            f"{zws} >> {inner_text} << {zws}",
+            f"{zws}  > {inner_text} <  {zws}"
         ]
         
-        for ctype in constraint_types:
-            constraints = cmds.listRelatives(node, type=ctype) or []
-            for c in constraints:
-                if cmds.objExists(c):
-                    cmds.delete(c)
+        if self._click_step <= len(frames):
+            super(CyberButton, self).setText(frames[self._click_step - 1])
+        else:
+            super(CyberButton, self).setText(self._base_text)
+            self._click_timer.stop()
+            self.end_flash()
+            
+    def end_flash(self):
+        self.setProperty("flashing", False)
+        self.style().unpolish(self)
+        self.style().polish(self)
 
-    def bake_sources_from_constraints(self, sample_by=1, euler_filter=True):
-        """
-        After rebuild_constraints has been called, bake the source objects
-        back to clean keyframes from the locator constraints, then delete
-        those constraints. This leaves sources with world-space keys that
-        are identical to their original positions — no constraints remain.
-        """
-        sources = [d["source"] for d in self.created_locators
-                   if cmds.objExists(d["source"])]
-        if not sources:
+
+class CyberProgressButton(CyberButton):
+    """Execution button that visually transforms into an inverted pixel-progress bar."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._is_progressing = False
+        self._target_progress = 0.0
+        self._current_progress = 0.0
+        self._progress_text = ""
+        
+        self._color_fill = QtGui.QColor("#00f3ff")
+        self._color_empty = QtGui.QColor(0, 243, 255, 40)
+        self._color_text_base = QtGui.QColor("#00f3ff")
+        self._color_text_inv = QtGui.QColor("#05060a")
+
+    def set_progress_colors(self, fill_hex, text_base_hex, text_inv_hex="#05060a"):
+        self._color_fill = QtGui.QColor(fill_hex)
+        self._color_empty = QtGui.QColor(fill_hex)
+        self._color_empty.setAlpha(40) # Faded empty dots
+        self._color_text_base = QtGui.QColor(text_base_hex)
+        self._color_text_inv = QtGui.QColor(text_inv_hex)
+
+    def start_progress(self):
+        self._is_progressing = True
+        self._target_progress = 0.0
+        self._current_progress = 0.0
+        self.setProperty("flashing", False)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+        QtWidgets.QApplication.processEvents()
+
+    def set_progress_blocking(self, val, text):
+        """Smoothly animates to the new value before freezing for Maya execution."""
+        self._target_progress = val
+        self._progress_text = text
+        
+        start_t = time.time()
+        # Force a mini 0.15s animation loop right before the thread is locked
+        while time.time() - start_t < 0.15:
+            diff = self._target_progress - self._current_progress
+            self._current_progress += diff * 0.3
+            if abs(diff) < 0.005:
+                self._current_progress = self._target_progress
+            self.update()
+            QtWidgets.QApplication.processEvents()
+            time.sleep(0.016)
+            
+        self._current_progress = self._target_progress
+        self.update()
+        QtWidgets.QApplication.processEvents()
+
+    def stop_progress(self):
+        self._is_progressing = False
+        self.update()
+        QtWidgets.QApplication.processEvents()
+
+    def paintEvent(self, event):
+        if not self._is_progressing:
+            super().paintEvent(event)
             return
 
-        start_time = cmds.playbackOptions(query=True, minTime=True)
-        end_time   = cmds.playbackOptions(query=True, maxTime=True)
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        
+        w, h = self.width(), self.height()
+        
+        # Base deep void background
+        painter.fillRect(0, 0, w, h, QtGui.QColor(10, 12, 18))
+        painter.setPen(QtGui.QPen(self._color_fill, 1))
+        painter.drawRect(0, 0, w-1, h-1)
 
-        cmds.refresh(suspend=True)
-        try:
-            cmds.bakeResults(
-                sources,
-                simulation=True,
-                time=(start_time, end_time),
-                sampleBy=sample_by,
-                disableImplicitControl=True,
-                preserveOutsideKeys=True,
-                sparseAnimCurveBake=False,
-                minimizeRotation=True,
-                controlPoints=False
-            )
-            # Delete the constraints we just baked from
-            for source in sources:
-                self._delete_constraints_on_node(source)
+        # Draw tech pixel grid
+        cell_size = 5
+        cols = int(w / cell_size) + 1
+        rows = int(h / cell_size) + 1
+        dot_r = cell_size * 0.35
+        
+        fill_w = w * self._current_progress
+        
+        painter.setPen(QtCore.Qt.NoPen)
+        for r in range(rows):
+            y = r * cell_size + cell_size / 2
+            for c in range(cols):
+                x = c * cell_size + cell_size / 2
+                
+                if x <= fill_w:
+                    painter.setBrush(self._color_fill)
+                else:
+                    painter.setBrush(self._color_empty)
+                    
+                painter.drawEllipse(QtCore.QPointF(x, y), dot_r, dot_r)
+        
+        # Draw Overlapping High-Contrast Text 
+        font = self.font()
+        font.setBold(True)
+        font.setLetterSpacing(QtGui.QFont.AbsoluteSpacing, 1)
+        painter.setFont(font)
+        rect = QtCore.QRectF(0, 0, w, h)
+        
+        # Unfilled Right Side (Glowing Text)
+        painter.setClipRect(QtCore.QRectF(fill_w, 0, w - fill_w, h))
+        painter.setPen(self._color_text_base)
+        painter.drawText(rect, QtCore.Qt.AlignCenter, self._progress_text)
+        
+        # Filled Left Side (Inverted Text)
+        painter.setClipRect(QtCore.QRectF(0, 0, fill_w, h))
+        painter.setPen(self._color_text_inv)
+        painter.drawText(rect, QtCore.Qt.AlignCenter, self._progress_text)
+        
+        painter.end()
 
-            if euler_filter:
-                cmds.select(sources)
-                cmds.filterCurve()
-        finally:
-            cmds.refresh(suspend=False)
 
-        print(f"[SpaceSwitch] Baked and released {len(sources)} source(s). "
-              "Original motion preserved as clean keyframes.")
+class CyberToggle(CyberButton):
+    def __init__(self, text, checked=False, *args, **kwargs):
+        super().__init__(text, *args, **kwargs)
+        self.base_text = text
+        self.setObjectName("ToggleBtn")
+        self.setCheckable(True)
+        
+        self.blockSignals(True)
+        self.setChecked(checked)
+        self.blockSignals(False)
+        
+        self.toggled.connect(self._on_toggled)
+        self._update_css_state()
+        self._set_final_text()
+
+    def sizeHint(self):
+        return QtWidgets.QPushButton.sizeHint(self)
+
+    def mousePressEvent(self, e):
+        QtWidgets.QPushButton.mousePressEvent(self, e)
+
+    def _update_css_state(self):
+        state_str = "on" if self.isChecked() else "off"
+        self.setProperty("toggle_state", state_str)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def _set_final_text(self):
+        final_text = f"   [X]   {self.base_text}" if self.isChecked() else f"   [ ]   {self.base_text}"
+        QtWidgets.QPushButton.setText(self, final_text)
+
+    def _on_toggled(self, checked):
+        self._update_css_state()
+        self.setProperty("flashing", True)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        
+        self._click_step = 0
+        self._click_timer.start(35) 
+
+    def _animate_click(self):
+        self._click_step += 1
+        is_on = self.isChecked()
+        
+        if is_on:
+            frames = [
+                f"   [-]   {self.base_text}",
+                f"  [ x ]  {self.base_text}",
+                f" [  X  ] {self.base_text}",
+                f"  [ X ]  {self.base_text}",
+                f"   [X]   {self.base_text}"
+            ]
+        else:
+            frames = [
+                f"   [x]   {self.base_text}",
+                f"  [ - ]  {self.base_text}",
+                f" [     ] {self.base_text}",
+                f"  [   ]  {self.base_text}",
+                f"   [ ]   {self.base_text}"
+            ]
+            
+        if self._click_step <= len(frames):
+            QtWidgets.QPushButton.setText(self, frames[self._click_step - 1])
+        else:
+            self._click_timer.stop()
+            self.end_flash()
+            self._set_final_text()
 
 
-# ============================================================================
-# DASHBOARD UI
-# ============================================================================
-class SpaceSwitchDashboard:
-    """Dockable dashboard UI for space switching."""
-    
+class CyberLineEdit(QtWidgets.QLineEdit):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setAlignment(QtCore.Qt.AlignCenter)
+        self.setReadOnly(True)
+        self._actual_text = ""
+        self._anim_step = 0
+        self._glitch_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#$%&*"
+        
+        self._anim_timer = QtCore.QTimer(self)
+        self._anim_timer.timeout.connect(self._animate_text)
+        
+    def set_cyber_text(self, text):
+        self._actual_text = text
+        self._anim_step = 0
+        self.setProperty("flashing", True)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self._anim_timer.start(40) 
+        
+    def _animate_text(self):
+        self._anim_step += 1
+        if self._anim_step > 8:
+            self._anim_timer.stop()
+            self.setText(self._actual_text)
+            self.setProperty("flashing", False)
+            self.style().unpolish(self)
+            self.style().polish(self)
+        else:
+            length = len(self._actual_text) if self._actual_text else 8
+            glitched = "".join(random.choice(self._glitch_chars) for _ in range(length))
+            self.setText(glitched)
+
+
+class CyberComboBox(QtWidgets.QComboBox):
+    """Custom combo box with an animated dropdown menu."""
+    def showPopup(self):
+        super().showPopup()
+        popup = self.view().window()
+        target_h = popup.geometry().height()
+        
+        self._popup_anim = QtCore.QPropertyAnimation(popup, b"maximumHeight")
+        self._popup_anim.setDuration(200)
+        self._popup_anim.setStartValue(0)
+        self._popup_anim.setEndValue(target_h)
+        self._popup_anim.setEasingCurve(QtCore.QEasingCurve.OutQuart)
+        
+        # Reset maximum height constraint so it doesn't break future usage
+        try: self._popup_anim.finished.disconnect() 
+        except Exception: pass
+        self._popup_anim.finished.connect(lambda: popup.setMaximumHeight(16777215))
+        
+        self._popup_anim.start()
+
+
+class PanelHeaderButton(CyberButton):
+    def trigger_flash(self):
+        pass
+        
+    def sizeHint(self):
+        hint = QtWidgets.QPushButton.sizeHint(self)
+        return QtCore.QSize(hint.width() + 6, hint.height())
+
+
+class CyberPanel(QtWidgets.QWidget):
+    def __init__(self, title, border_color="rgba(0, 243, 255, 0.15)"):
+        super().__init__()
+        self.border_color = border_color
+        self.lay = QtWidgets.QVBoxLayout(self)
+        self.lay.setContentsMargins(0, 0, 0, 0)
+        self.lay.setSpacing(0)
+
+        self.title_base = title
+        zws = "\u200B"
+        self.header = PanelHeaderButton(f"{title}    [-]  {zws}")
+        self.header.setObjectName("GroupLabel")
+        self.header.clicked.connect(self.toggle)
+
+        self.content = QtWidgets.QFrame()
+        self.content.setObjectName("HudPanel")
+        
+        self._apply_base_style()
+        
+        self._opacity_eff = QtWidgets.QGraphicsOpacityEffect(self.content)
+        self._opacity_eff.setOpacity(1.0)
+        self.content.setGraphicsEffect(self._opacity_eff)
+        
+        self.content_lay = QtWidgets.QVBoxLayout(self.content)
+        self.content_lay.setContentsMargins(6, 6, 6, 6)
+        self.content_lay.setSpacing(4)
+
+        self.lay.addWidget(self.header)
+        self.lay.addWidget(self.content)
+
+        self.is_collapsed = False
+        
+        # UI Animation Timers
+        self._anim_timer = QtCore.QTimer(self)
+        self._anim_timer.timeout.connect(self._animate_brackets)
+        self._anim_step = 0
+        self._anim_frames = []
+
+        self._flicker_timer = QtCore.QTimer(self)
+        self._flicker_timer.timeout.connect(self._flicker_tick)
+        self._flicker_step = 0
+
+        self._h_anim = QtCore.QPropertyAnimation(self.content, b"maximumHeight")
+        self._h_anim.setDuration(150)
+        self._h_anim.setEasingCurve(QtCore.QEasingCurve.InOutQuad)
+        self._h_anim.valueChanged.connect(self._on_height_change)
+        
+        self._o_anim = QtCore.QPropertyAnimation(self._opacity_eff, b"opacity")
+        self._o_anim.setDuration(100) 
+        self._o_anim.setEasingCurve(QtCore.QEasingCurve.InOutQuad)
+
+    def _apply_base_style(self):
+        self.content.setStyleSheet(f"""
+            QFrame#HudPanel {{
+                border: 1px solid rgba(0, 243, 255, 0.15);
+                border-left: 2px solid {self.border_color};
+                background: rgba(10, 12, 18, 0.9);
+            }}
+        """)
+
+    def _on_height_change(self, value):
+        win = self.window()
+        if hasattr(win, "optimize_space"):
+            win.optimize_space()
+
+    def update_title(self, new_title):
+        self.title_base = new_title
+        zws = "\u200B"
+        if self.is_collapsed:
+            self.header.setText(f"{self.title_base}    [+]  {zws}")
+        else:
+            self.header.setText(f"{self.title_base}    [-]  {zws}")
+
+    def toggle(self):
+        zws = "\u200B"
+        try: self._h_anim.finished.disconnect()
+        except Exception: pass
+
+        if self.is_collapsed:
+            # --- EXPANDING ---
+            self._flicker_timer.stop()
+            self.content.setVisible(True)
+            self._apply_base_style()
+            self.is_collapsed = False
+            
+            target_h = self.content.sizeHint().height()
+            self._h_anim.setStartValue(0)
+            self._h_anim.setEndValue(target_h)
+            self._h_anim.finished.connect(lambda: self.content.setMaximumHeight(16777215))
+            self._h_anim.start()
+            
+            self._anim_frames = [
+                f"{self.title_base}   [ + ] {zws}",
+                f"{self.title_base}  [  +  ]{zws}",
+                f"{self.title_base}  [     ]{zws}",
+                f"{self.title_base}  [  -  ]{zws}",
+                f"{self.title_base}   [ - ] {zws}",
+                f"{self.title_base}    [-]  {zws}"
+            ]
+            self._anim_step = 0
+            self._anim_timer.start(35) 
+            
+            self._flash_type = "green"
+            self._flicker_step = 0
+            self._flicker_max = 8 
+            self._flicker_timer.setInterval(40)
+            self._flicker_timer.start()
+        else:
+            # --- COLLAPSING ---
+            self.is_collapsed = True
+            
+            self._anim_frames = [
+                f"{self.title_base}   [ - ] {zws}",
+                f"{self.title_base}  [  -  ]{zws}",
+                f"{self.title_base}  [     ]{zws}",
+                f"{self.title_base}  [  +  ]{zws}",
+                f"{self.title_base}   [ + ] {zws}",
+                f"{self.title_base}    [+]  {zws}"
+            ]
+            self._anim_step = 0
+            self._anim_timer.start(35) 
+            
+            self._flash_type = "red"
+            self._flicker_step = 0
+            self._flicker_max = 6 
+            self._flicker_timer.setInterval(20)
+            self._flicker_timer.start()
+
+    def _flicker_tick(self):
+        self._flicker_step += 1
+        buttons = self.content.findChildren(QtWidgets.QPushButton)
+        
+        if self._flicker_step <= self._flicker_max:
+            progress = self._flicker_step / float(self._flicker_max)
+            
+            if self._flash_type == "red":
+                if random.random() > 0.4:
+                    fade_op = random.uniform(0.0, 0.2) 
+                else:
+                    fade_op = random.uniform(0.5, 0.9) * (1.0 - progress)
+                self._opacity_eff.setOpacity(fade_op)
+                
+                if random.random() > 0.4:
+                    self.content.setStyleSheet("""
+                        QFrame#HudPanel { 
+                            border: 1px solid rgba(255, 68, 68, 0.8); 
+                            border-left: 4px solid #ff4444; 
+                            background: rgba(40, 10, 10, 0.9); 
+                        }
+                    """)
+                else:
+                    self._apply_base_style()
+                
+                self._flicker_timer.setInterval(random.randint(15, 50)) 
+            else:
+                surge_op = progress * random.uniform(0.8, 1.0)
+                self._opacity_eff.setOpacity(surge_op)
+                self._flicker_timer.setInterval(random.randint(20, 60)) 
+            
+            for btn in buttons:
+                if not hasattr(btn, "_glitch_orig_text"):
+                    btn._glitch_orig_text = btn.text()
+                    
+                if random.random() > 0.4: 
+                    if self._flash_type == "green" and progress > 0.8:
+                        btn.setProperty("flash_color", "white")
+                    else:
+                        btn.setProperty("flash_color", self._flash_type)
+                        
+                    if random.random() > 0.4:
+                        chevs = [">>> <<<", ">> <<", " > < ", "xXx", "---"]
+                        QtWidgets.QPushButton.setText(btn, f"\u200B{random.choice(chevs)}\u200B")
+                else:
+                    btn.setProperty("flash_color", "")
+                    QtWidgets.QPushButton.setText(btn, btn._glitch_orig_text)
+                    
+                btn.style().unpolish(btn)
+                btn.style().polish(btn)
+                
+        else:
+            self._flicker_timer.stop()
+            
+            for btn in buttons:
+                btn.setProperty("flash_color", "")
+                if hasattr(btn, "_glitch_orig_text"):
+                    QtWidgets.QPushButton.setText(btn, btn._glitch_orig_text)
+                    del btn._glitch_orig_text
+                btn.style().unpolish(btn)
+                btn.style().polish(btn)
+            
+            if self._flash_type == "red":
+                self.content.setStyleSheet("""
+                    QFrame#HudPanel { 
+                        border: 1px solid rgba(255, 68, 68, 0.8); 
+                        border-left: 4px solid #ff4444; 
+                        background: rgba(30, 5, 5, 0.9); 
+                    }
+                """)
+                current_h = self.content.height()
+                self.content.setMaximumHeight(current_h)
+                self._h_anim.setStartValue(current_h)
+                self._h_anim.setEndValue(0)
+                self._h_anim.finished.connect(lambda: self.content.setVisible(False))
+                
+                self._o_anim.setStartValue(self._opacity_eff.opacity())
+                self._o_anim.setEndValue(0.0)
+                
+                self._h_anim.start()
+                self._o_anim.start()
+            else:
+                self._opacity_eff.setOpacity(1.0)
+                self._apply_base_style()
+
+    def _animate_brackets(self):
+        if self._anim_step < len(self._anim_frames):
+            self.header.setText(self._anim_frames[self._anim_step])
+            self._anim_step += 1
+        else:
+            self._anim_timer.stop()
+
+
+class XYZDelegate(QtWidgets.QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        painter.save()
+        if option.state & QtWidgets.QStyle.State_Selected:
+            painter.fillRect(option.rect, QtGui.QColor(0, 243, 255, 40))
+        else:
+            painter.fillRect(option.rect, QtGui.QColor(10, 12, 18))
+            
+        text = index.data()
+        fm = painter.fontMetrics()
+        width_func = fm.horizontalAdvance if hasattr(fm, "horizontalAdvance") else fm.width
+        
+        x_offset = option.rect.left() + 6
+        y_offset = option.rect.top() + (option.rect.height() - fm.height()) // 2 + fm.ascent()
+        
+        for char in text:
+            if char == 'X': painter.setPen(QtGui.QColor("#ff5555"))
+            elif char == 'Y': painter.setPen(QtGui.QColor("#55ff55"))
+            elif char == 'Z': painter.setPen(QtGui.QColor("#55aaff"))
+            else: painter.setPen(QtGui.QColor("#e0e7ff"))
+            painter.drawText(x_offset, y_offset, char)
+            x_offset += width_func(char)
+        painter.restore()
+
+
+# ==============================================================================
+# MAIN DASHBOARD UI
+# ==============================================================================
+
+class SpaceSwitchDashboard(QtWidgets.QMainWindow):
     def __init__(self):
-        self.switcher = SpaceSwitcher()
-        self.preview_locator = None
-        self.target_object = None
-        self.source_objects = []  # List of source objects for multi-source support
+        super().__init__()
+        self.logic = SpaceSwitcher()
+        self.preview_loc = None
+        
         self.settings = {
-            "space_mode": "world",
-            "translate": True,
-            "rotate": True,
-            "aim_at_target": False,
-            "rotation_order": 0,
-            "locator_size": 1,
-            "hide_offset_locators": True,
-            "bake_master_space": False,
-            "bake_master_layer": False,
-            "bake_offset_layer": False,
-            "add_to_display_layer": False,
-            "num_offsets": 2,
-            "color_index": 17,
-            "sample_by": 1,
-            "euler_filter": True,
-            "clean_static": True,
-            "static_threshold": 0.001,
-            "auto_best_order": True,
+            "mode": "World", "translate": True, "rotate": True, "auto_detect": False, "rot_order": 0,
+            "scale": 1.5, "offsets": 2, "hide_offset": True, "color": "yellow", "add_layer": False,
+            "sample_by": 1, "euler": True, "clean_static": True, "threshold": 0.001,
+            "bake_master": False, "bake_master_anim": False, "bake_offset_anim": False
         }
         
-        self.build_ui()
-    
-    def build_ui(self):
-        """Build the dashboard UI."""
-        # Delete existing window if it exists
-        if cmds.window(WINDOW_NAME, exists=True):
-            cmds.deleteUI(WINDOW_NAME)
-        
-        # Delete preview locator if exists
-        if cmds.objExists("_SS_preview_locator"):
-            cmds.delete("_SS_preview_locator")
-        
-        # Create window
-        self.window = cmds.window(
-            WINDOW_NAME,
-            title=WINDOW_TITLE,
-            widthHeight=(320, 520),
-            sizeable=True
-        )
-        
-        # Main layout
-        main_layout = cmds.columnLayout(adjustableColumn=True, rowSpacing=5)
-        
-        # ===== SPACE MODE =====
-        cmds.frameLayout(label="Space Mode", collapsable=True, marginWidth=5, marginHeight=5)
-        cmds.columnLayout(adjustableColumn=True)
-        
-        # Custom Radio Collection to support 5 modes (Grp limits to 4)
-        self.mode_collection = cmds.radioCollection()
-        
-        # Row 1
-        cmds.rowLayout(numberOfColumns=3)
-        self.rb_world = cmds.radioButton(label="World", select=True, 
-                                       onCommand=partial(self._on_space_mode_change, "world"))
-        self.rb_local = cmds.radioButton(label="Local", 
-                                       onCommand=partial(self._on_space_mode_change, "local"))
-        self.rb_object = cmds.radioButton(label="Object", 
-                                        onCommand=partial(self._on_space_mode_change, "object"))
-        cmds.setParent("..")
-        
-        # Row 2
-        cmds.rowLayout(numberOfColumns=2)
-        self.rb_camera = cmds.radioButton(label="Camera", 
-                                        onCommand=partial(self._on_space_mode_change, "camera"))
-        self.rb_aim = cmds.radioButton(label="Aim", 
-                                     onCommand=partial(self._on_space_mode_change, "aim"))
-        cmds.setParent("..")
-        
-        
-        # Source Field (supports multiple objects)
-        cmds.rowLayout(numberOfColumns=3, adjustableColumn=2)
-        cmds.text(label="Source: ", width=50)
-        self.source_field = cmds.textField(editable=False, width=180,
-            annotation="Supports multiple objects. Use 'Pick' to load current selection.")
-        cmds.button(label="Pick", width=50, command=partial(self._pick_object, "source"))
-        cmds.setParent("..")
+        self.setup_ui()
+        self.populate_initial()
 
-        # Auto-populate Source from selection on load
+    def setup_ui(self):
+        def make_lbl(text):
+            lbl = QtWidgets.QLabel(text)
+            lbl.setStyleSheet("color: rgba(255,255,255,0.4); font-weight: bold;")
+            lbl.setAlignment(QtCore.Qt.AlignCenter)
+            lbl.setMinimumWidth(50) # Reduced minimum width to save horizontal space
+            return lbl
+
+        self.setWindowTitle(WINDOW_TITLE)
+        self.setMinimumWidth(500) # Expanded minimum width to force the window wide enough for all 5 mode buttons
+        self.resize(500, 750) # Set a wider, more natural starting portrait ratio
+        self.setStyleSheet(QSS)
+        self.setWindowFlags(QtCore.Qt.WindowStaysOnTopHint)
+        
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        main_lay = QtWidgets.QVBoxLayout(central)
+        main_lay.setContentsMargins(10, 10, 10, 10)
+        main_lay.setSpacing(6)
+
+        # --- GLITCH HEADER ---
+        header_lay = QtWidgets.QHBoxLayout()
+        title_lbl = QtWidgets.QLabel("SPACE.SWITCH")
+        title_lbl.setStyleSheet("color: white; font-size: 22px; font-weight: bold; letter-spacing: -1px;")
+        ver_lbl = QtWidgets.QLabel("V1.0_CORE")
+        ver_lbl.setStyleSheet("color: rgba(255,255,255,0.4); font-size: 8px;")
+        header_lay.addWidget(title_lbl)
+        header_lay.addStretch()
+        header_lay.addWidget(ver_lbl, alignment=QtCore.Qt.AlignBottom)
+        main_lay.addLayout(header_lay)
+        
+        sep = QtWidgets.QFrame()
+        sep.setFrameShape(QtWidgets.QFrame.HLine)
+        sep.setStyleSheet("background: rgba(255,255,255,0.1); max-height: 1px; margin-bottom: 5px;")
+        main_lay.addWidget(sep)
+
+        # --- SCROLL AREA ---
+        self.scroll = QtWidgets.QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setAlignment(QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
+        
+        # Absolutely ban horizontal scrolling to force components to fit the window
+        self.scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        
+        self.scroll_content = QtWidgets.QWidget()
+        # Force a minimum internal width so elements never get squished, 
+        # compelling the main window to adapt to this size
+        self.scroll_content.setMinimumWidth(470) 
+        
+        self.scroll_lay = QtWidgets.QVBoxLayout(self.scroll_content)
+        self.scroll_lay.setContentsMargins(0, 0, 0, 0)
+        self.scroll_lay.setSpacing(4)
+        self.scroll.setWidget(self.scroll_content)
+        main_lay.addWidget(self.scroll)
+
+        # --- 1. SELECTION PANEL ---
+        p_sel = CyberPanel("SELECTION", border_color="rgba(0, 243, 255, 0.5)")
+        self.scroll_lay.addWidget(p_sel)
+        
+        s_grid = QtWidgets.QGridLayout()
+        s_grid.setContentsMargins(0, 0, 0, 0)
+        s_grid.setSpacing(4)
+        
+        self.ui_source = CyberLineEdit()
+        self.ui_source.setObjectName("SourceInput")
+        self.ui_source.setPlaceholderText("...")
+        s_btn = CyberButton("PICK")
+        s_btn.setFixedWidth(45)
+        s_btn.clicked.connect(lambda *args: self.pick_object("source"))
+        
+        s_grid.addWidget(make_lbl("SOURCE:"), 0, 0)
+        s_grid.addWidget(self.ui_source, 0, 1)
+        s_grid.addWidget(s_btn, 0, 2)
+
+        self.ui_target = CyberLineEdit()
+        self.ui_target.setObjectName("TargetInput")
+        self.ui_target.setPlaceholderText("...")
+        t_btn = CyberButton("PICK")
+        t_btn.setFixedWidth(45)
+        t_btn.clicked.connect(lambda *args: self.pick_object("target"))
+        
+        s_grid.addWidget(make_lbl("TARGET:"), 1, 0)
+        s_grid.addWidget(self.ui_target, 1, 1)
+        s_grid.addWidget(t_btn, 1, 2)
+        
+        p_sel.content_lay.addLayout(s_grid)
+
+        # --- 2. SPACE MODE ---
+        self.p_mode = CyberPanel("SPACE MODE // WORLD".ljust(22, "\xA0"))
+        self.scroll_lay.addWidget(self.p_mode)
+
+        mode_grp = QtWidgets.QHBoxLayout()
+        mode_grp.setSpacing(2)
+        self.mode_btns = QtWidgets.QButtonGroup(self)
+        
+        for i, m in enumerate(["World", "Local", "Object", "Camera", "Aim"]):
+            b = CyberButton(m)
+            b.setObjectName("ModeBtn")
+            b.setCheckable(True)
+            self.mode_btns.addButton(b, i)
+            
+            if i == 0:
+                b.setChecked(True)
+            
+            b.clicked.connect(lambda *args, txt=m: self.set_space_mode(txt))
+            mode_grp.addWidget(b)
+            
+        self.p_mode.content_lay.addLayout(mode_grp)
+
+        tgl_lay = QtWidgets.QHBoxLayout()
+        self.ui_trans = CyberToggle("TRANSLATION", checked=True)
+        self.ui_trans.toggled.connect(lambda x: self.update_s("translate", x))
+        self.ui_rot = CyberToggle("ROTATION", checked=True)
+        self.ui_rot.toggled.connect(lambda x: self.update_s("rotate", x))
+        tgl_lay.addWidget(self.ui_trans); tgl_lay.addWidget(self.ui_rot)
+        self.p_mode.content_lay.addLayout(tgl_lay)
+
+        rot_lay = QtWidgets.QHBoxLayout()
+        rot_lay.addWidget(make_lbl("ROT_ORDER"))
+        
+        self.ui_rot_order = CyberComboBox()
+        self.ui_rot_order.addItems(["XYZ", "YZX", "ZXY", "XZY", "YXZ", "ZYX"])
+        self.ui_rot_order.setItemDelegate(XYZDelegate(self.ui_rot_order))
+        
+        rot_container = QtWidgets.QWidget()
+        r_grid = QtWidgets.QGridLayout(rot_container)
+        r_grid.setContentsMargins(0,0,0,0)
+        self.ui_rot_order.setStyleSheet("QComboBox { color: transparent; }") 
+        self.ui_rot_overlay = QtWidgets.QLabel()
+        self.ui_rot_overlay.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
+        self.ui_rot_overlay.setStyleSheet("background: transparent; border: none; padding-left: 5px;")
+        
+        r_grid.addWidget(self.ui_rot_order, 0, 0)
+        r_grid.addWidget(self.ui_rot_overlay, 0, 0, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        
+        # Setup Flash Timer
+        self._rot_flash_timer = QtCore.QTimer(self)
+        self._rot_flash_timer.timeout.connect(self._rot_flash_tick)
+        self._rot_flash_step = 0
+        self._rot_target_text = ""
+        
+        self.ui_rot_order.currentIndexChanged.connect(self.trigger_rot_flash)
+        self.trigger_rot_flash(0, initial=True)
+        
+        self.ui_auto_det = CyberToggle("AUTO_DETECT", checked=False)
+        self.ui_auto_det.toggled.connect(self.toggle_auto_detect)
+        
+        rot_lay.addWidget(rot_container)
+        rot_lay.addWidget(self.ui_auto_det)
+        self.p_mode.content_lay.addLayout(rot_lay)
+
+        # --- 3. LOCATOR SETTINGS ---
+        p_loc = CyberPanel("LOCATOR_SYS")
+        self.scroll_lay.addWidget(p_loc)
+        
+        btn_prev = CyberButton("[ CREATE PREVIEW LOCATOR ]")
+        btn_prev.setStyleSheet("border-color: #55ff55; color: #55ff55;")
+        btn_prev.clicked.connect(self.create_preview)
+        p_loc.content_lay.addWidget(btn_prev)
+
+        scale_lay = QtWidgets.QHBoxLayout()
+        scale_lay.addWidget(make_lbl("SCALE"))
+        btn_minus = CyberButton("-"); btn_minus.setFixedWidth(24); btn_minus.clicked.connect(lambda *args: self.adj_scale(-0.25))
+        btn_plus = CyberButton("+"); btn_plus.setFixedWidth(24); btn_plus.clicked.connect(lambda *args: self.adj_scale(0.25))
+        self.ui_scale = QtWidgets.QDoubleSpinBox()
+        self.ui_scale.setValue(1.5); self.ui_scale.setSingleStep(0.1); self.ui_scale.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+        self.ui_scale.valueChanged.connect(lambda x: self.update_s("scale", x))
+        
+        scale_lay.addWidget(btn_minus); scale_lay.addWidget(btn_plus); scale_lay.addWidget(self.ui_scale)
+        scale_lay.addSpacing(10)
+        
+        scale_lay.addWidget(make_lbl("OFFSETS"))
+        self.ui_offsets = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.ui_offsets.setRange(0, 5); self.ui_offsets.setValue(2)
+        self.ui_offsets_lbl = QtWidgets.QLabel("2", styleSheet="color: #ff00ea; font-weight: bold; width: 15px;")
+        self.ui_offsets.valueChanged.connect(self.sync_offsets)
+        scale_lay.addWidget(self.ui_offsets)
+        scale_lay.addWidget(self.ui_offsets_lbl)
+        p_loc.content_lay.addLayout(scale_lay)
+
+        color_lay = QtWidgets.QHBoxLayout()
+        color_lay.addWidget(make_lbl("COLOR"))
+        self.color_btns = {}
+        for name, hex_val in UI_COLORS.items():
+            cb = CyberButton()
+            cb.setFixedSize(22, 16)
+            cb.setStyleSheet(f"background: {hex_val}; border: none; opacity: 0.5;")
+            cb.clicked.connect(lambda *args, n=name: self.set_color(n))
+            self.color_btns[name] = cb
+            color_lay.addWidget(cb)
+        p_loc.content_lay.addLayout(color_lay)
+        self.set_color("yellow") 
+
+        loc_tgl_lay = QtWidgets.QHBoxLayout()
+        self.ui_hide_off = CyberToggle("HIDE_OFFSETS", checked=True)
+        self.ui_hide_off.toggled.connect(lambda x: self.update_s("hide_offset", x))
+        self.ui_add_lyr = CyberToggle("ADD_TO_LAYER", checked=False)
+        self.ui_add_lyr.toggled.connect(lambda x: self.update_s("add_layer", x))
+        loc_tgl_lay.addWidget(self.ui_hide_off); loc_tgl_lay.addWidget(self.ui_add_lyr)
+        p_loc.content_lay.addLayout(loc_tgl_lay)
+
+        # --- 4. BAKE PARAMS ---
+        p_bake = CyberPanel("BAKE_PARAMS", border_color="rgba(255, 0, 234, 0.5)")
+        self.scroll_lay.addWidget(p_bake)
+
+        bake_grid = QtWidgets.QGridLayout()
+        bake_grid.setContentsMargins(0, 0, 0, 0)
+        bake_grid.setSpacing(4)
+
+        bake_grid.addWidget(make_lbl("SAMPLE"), 0, 0)
+        self.ui_sample = CyberComboBox()
+        self.ui_sample.addItems(["1", "2", "3"])
+        self.ui_sample.currentIndexChanged.connect(lambda *args: self.update_s("sample_by", int(self.ui_sample.currentText())))
+        bake_grid.addWidget(self.ui_sample, 0, 1)
+
+        self.ui_euler = CyberToggle("EULER_FILTER", checked=True)
+        self.ui_euler.toggled.connect(lambda x: self.update_s("euler", x))
+        bake_grid.addWidget(self.ui_euler, 0, 2)
+
+        bake_grid.addWidget(make_lbl("THRESH"), 1, 0)
+        self.ui_thresh = QtWidgets.QDoubleSpinBox()
+        self.ui_thresh.setDecimals(3); self.ui_thresh.setSingleStep(0.001); self.ui_thresh.setValue(0.001)
+        self.ui_thresh.valueChanged.connect(lambda x: self.update_s("threshold", x))
+        bake_grid.addWidget(self.ui_thresh, 1, 1)
+
+        self.ui_clean = CyberToggle("CLEAN_STATIC", checked=True)
+        self.ui_clean.toggled.connect(lambda x: self.update_s("clean_static", x))
+        bake_grid.addWidget(self.ui_clean, 1, 2)
+
+        self.ui_bake_master = CyberToggle("BAKE_MASTER_SPACE", checked=False)
+        self.ui_bake_master.toggled.connect(lambda x: self.update_s("bake_master", x))
+        bake_grid.addWidget(self.ui_bake_master, 2, 0, 1, 3)
+
+        p_bake.content_lay.addLayout(bake_grid)
+
+        # --- 5. EXECUTION ---
+        p_exec = CyberPanel("EXECUTION_HOLDER")
+        self.scroll_lay.addWidget(p_exec)
+
+        e1_lay = QtWidgets.QHBoxLayout()
+        self.ui_stage = CyberComboBox()
+        self.ui_stage.addItems(["STAGE 1: Create Setup", "STAGE 2: Constrain & Bake"])
+        e_run = CyberButton("RUN")
+        e_run.clicked.connect(self.run_full_action)
+        e1_lay.addWidget(self.ui_stage); e1_lay.addWidget(e_run)
+        p_exec.content_lay.addLayout(e1_lay)
+
+        self.btn_full = CyberProgressButton("[ RUN FULL SPACE SWITCH ]")
+        self.btn_full.setObjectName("ActionPrimary")
+        self.btn_full.set_progress_colors("#00f3ff", "#00f3ff", "#05060a")
+        self.btn_full.clicked.connect(self.run_full_action)
+        p_exec.content_lay.addWidget(self.btn_full)
+
+        self.btn_down = CyberProgressButton("[ BAKE SOURCES DOWN ]")
+        self.btn_down.setObjectName("ActionOrange")
+        self.btn_down.set_progress_colors("#f6a226", "#f6a226", "#05060a")
+        self.btn_down.clicked.connect(self.bake_sources_down)
+        p_exec.content_lay.addWidget(self.btn_down)
+
+        clean_lay = QtWidgets.QHBoxLayout()
+        btn_sel = CyberButton("SELECT LOCATORS")
+        btn_sel.clicked.connect(self.select_locators)
+        btn_del = CyberButton("DELETE ALL")
+        btn_del.setObjectName("Danger")
+        btn_del.clicked.connect(self.logic.cleanup)
+        clean_lay.addWidget(btn_sel); clean_lay.addWidget(btn_del)
+        p_exec.content_lay.addLayout(clean_lay)
+        
+        self.scroll_lay.addStretch()
+
+    # --- UI Dynamic Sizing Logic ---
+    def optimize_space(self):
+        content_h = self.scroll_content.sizeHint().height()
+        
+        if content_h < 850:
+            self.scroll.setMinimumHeight(content_h)
+            self.scroll.setMaximumHeight(content_h)
+            self.scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        else:
+            self.scroll.setMinimumHeight(200) 
+            self.scroll.setMaximumHeight(850)
+            self.scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+            
+        # Dynamically scale both height AND width to naturally frame the content
+        target_h = self.centralWidget().sizeHint().height()
+        target_w = self.centralWidget().sizeHint().width()
+        
+        # Added +20 padding buffer to the target width calculation to ensure borders don't crowd
+        current_w = max(self.width(), target_w + 20, 500)
+        self.resize(current_w, target_h)
+
+    # --- UI Logic Methods ---
+    def populate_initial(self):
         sel = cmds.ls(selection=True)
         if sel:
-            self.source_objects = list(sel)
-            display_text = ", ".join(sel) if len(sel) <= 3 else f"{sel[0]} ... ({len(sel)} objects)"
-            cmds.textField(self.source_field, edit=True, text=display_text)
+            self.ui_source.set_cyber_text(", ".join(sel))
 
-        # Target Field
-        cmds.rowLayout(numberOfColumns=3, adjustableColumn=2)
-        cmds.text(label="Target: ", width=50)
-        self.target_field = cmds.textField(editable=True, width=180) # Always enabled
-        self.target_pick_btn = cmds.button(label="Pick", width=50, command=partial(self._pick_object, "target"))
-        cmds.setParent("..")
-        
-        cmds.setParent("..")
-        cmds.setParent("..")
-        
-        # ===== ATTRIBUTES =====
-        cmds.frameLayout(label="Attributes", collapsable=True, marginWidth=5, marginHeight=5)
-        cmds.columnLayout(adjustableColumn=True)
-        
-        cmds.rowLayout(numberOfColumns=2)
-        cmds.checkBox(
-            label="Translation", value=True,
-            changeCommand=lambda x: self._update_setting("translate", x)
-        )
-        cmds.checkBox(
-            label="Rotation", value=True,
-            changeCommand=lambda x: self._update_setting("rotate", x)
-        )
-        cmds.setParent("..")
-        
-        cmds.rowLayout(numberOfColumns=3, adjustableColumn=3)
-        cmds.text(label="Rotation Order: ")
-        self.rot_order_menu = cmds.optionMenu(
-            changeCommand=self._on_rotation_order_change
-        )
-        for ro in ROTATION_ORDERS:
-            cmds.menuItem(label=ro.upper())
-        
-        cmds.checkBox(
-            label="Auto-Detect", 
-            value=True,
-            annotation="Automatically calculate best rotation order to avoid gimbal lock.",
-            changeCommand=lambda x: self._update_setting("auto_best_order", x)
-        )
-        cmds.setParent("..")
-        
-        cmds.setParent("..")
-        cmds.setParent("..")
-        
-        # ===== LOCATOR SETTINGS =====
-        cmds.frameLayout(label="Locator Settings", collapsable=True, marginWidth=5, marginHeight=5)
-        cmds.columnLayout(adjustableColumn=True)
-        
-        cmds.button(
-            label="Create Preview Locator",
-            command=self._create_preview_locator,
-            backgroundColor=(0.3, 0.5, 0.3)
-        )
-        
-        cmds.rowLayout(numberOfColumns=4, adjustableColumn=4, columnWidth4=[50, 40, 40, 60], columnAlign4=["left", "center", "center", "left"])
-        cmds.text(label="Scale: ", width=50)
-        cmds.button(
-            label="-", width=40,
-            command=partial(self._adj_scale, False),
-            annotation="Divide scale by factor"
-        )
-        cmds.button(
-            label="+", width=40,
-            command=partial(self._adj_scale, True),
-            annotation="Multiply scale by factor"
-        )
-        self.scale_factor_field = cmds.floatField(
-            value=1.5, precision=2, width=60,
-            annotation="Multiplication factor"
-        )
-        cmds.setParent("..")
-        
-        cmds.rowLayout(numberOfColumns=3, adjustableColumn=3)
-        cmds.text(label="Offsets: ", width=50)
-        self.offset_slider = cmds.intSliderGrp(
-            field=True,
-            minValue=1, maxValue=5, value=2,
-            changeCommand=lambda x: self._update_setting("num_offsets", int(x))
-        )
-        cmds.checkBox(
-            label="Hide Offset",
-            value=True,
-            annotation="Hide offset locator shape by default.",
-            changeCommand=lambda x: self._update_setting("hide_offset_locators", x)
-        )
-        cmds.setParent("..")
-        
-        # Color buttons
-        cmds.text(label="Color:", align="left")
-        cmds.rowLayout(numberOfColumns=8, columnWidth=[(i+1, 35) for i in range(8)])
-        
-        color_buttons = [
-            ("red", (0.8, 0.2, 0.2)),
-            ("yellow", (0.9, 0.9, 0.2)),
-            ("green", (0.2, 0.8, 0.2)),
-            ("blue", (0.2, 0.4, 0.9)),
-            ("purple", (0.6, 0.2, 0.8)),
-            ("white", (0.9, 0.9, 0.9)),
-            ("cyan", (0.2, 0.8, 0.8)),
-            ("orange", (0.9, 0.5, 0.1)),
-        ]
-        
-        for color_name, rgb in color_buttons:
-            cmds.button(
-                label="",
-                width=32, height=25,
-                backgroundColor=rgb,
-                command=partial(self._on_color_select, color_name)
-            )
-        
-        cmds.setParent("..")
-
-        cmds.rowLayout(numberOfColumns=2)
-        cmds.checkBox(
-            label="Add to Display Layer",
-            value=False,
-            annotation="Add offset locators to a display layer 'SpaceSwitch_Layer'.",
-            changeCommand=lambda x: self._update_setting("add_to_display_layer", x)
-        )
-        cmds.setParent("..")
-
-        cmds.setParent("..")
-        cmds.setParent("..")
-        
-        # ===== BAKE OPTIONS =====
-        cmds.frameLayout(label="Bake Options", collapsable=True, marginWidth=5, marginHeight=5)
-        cmds.columnLayout(adjustableColumn=True)
-        
-        cmds.rowLayout(numberOfColumns=3)
-        cmds.text(label="Sample By: ")
-        cmds.optionMenu(changeCommand=lambda x: self._update_setting("sample_by", int(x)))
-        cmds.menuItem(label="1")
-        cmds.menuItem(label="2")
-        cmds.menuItem(label="5")
-        cmds.menuItem(label="10")
-        cmds.checkBox(
-            label="Euler Filter", value=True,
-            changeCommand=lambda x: self._update_setting("euler_filter", x)
-        )
-        cmds.setParent("..")
-        
-        cmds.rowLayout(numberOfColumns=3)
-        cmds.checkBox(
-            label="Clean Static Keys", value=True,
-            changeCommand=lambda x: self._update_setting("clean_static", x)
-        )
-        cmds.text(label=" Threshold: ")
-        cmds.floatField(
-            value=0.001, precision=4, width=60,
-            changeCommand=lambda x: self._update_setting("static_threshold", x)
-        )
-        cmds.setParent("..")
-
-        cmds.rowLayout(numberOfColumns=2)
-        cmds.checkBox(
-            label="Bake Master Space", 
-            value=False,
-            annotation="Bakes the Master Group and deletes its constraints before baking locators.",
-            changeCommand=lambda x: self._update_setting("bake_master_space", x)
-        )
-        cmds.setParent("..")
-        
-        cmds.rowLayout(numberOfColumns=2)
-        cmds.checkBox(
-            label="Bake Master to Anim Layer",
-            value=False,
-            annotation="If baking master space, put animation on 'Master_Space_AnimLayer'.",
-            changeCommand=lambda x: self._update_setting("bake_master_layer", x)
-        )
-        cmds.checkBox(
-            label="Bake Offset to Anim Layer",
-            value=False,
-            annotation="Put offset locator animation on 'Offset_AnimLayer'.",
-            changeCommand=lambda x: self._update_setting("bake_offset_layer", x)
-        )
-        cmds.setParent("..")
-
-        cmds.setParent("..")
-        
-        cmds.setParent("..")
-        cmds.setParent("..")
-        
-        # ===== STAGE DROPDOWN =====
-        cmds.frameLayout(label="Workflow Stages", collapsable=False, marginWidth=5, marginHeight=5)
-        cmds.columnLayout(adjustableColumn=True, rowSpacing=5)
-        
-        cmds.rowLayout(numberOfColumns=2, adjustableColumn=1, columnWidth2=[200, 100])
-        self.stage_menu = cmds.optionMenu(label="")
-        cmds.menuItem(label="STAGE 1: Create Setup")
-        cmds.menuItem(label="STAGE 2: Bake to Locators")
-        cmds.menuItem(label="STAGE 3: Rebuild Constraints")
-        
-        cmds.button(
-            label="RUN",
-            height=30,
-            backgroundColor=(0.3, 0.5, 0.4),
-            command=self._run_selected_stage,
-            annotation="Execute the selected stage"
-        )
-        cmds.setParent("..")
-        
-        cmds.setParent("..")
-        cmds.setParent("..")
-
-        # ===== FULL PROCESS =====
-        cmds.frameLayout(label="Main Action", collapsable=False, marginWidth=5, marginHeight=5)
-        cmds.columnLayout(adjustableColumn=True)
-        
-        cmds.button(
-            label="RUN FULL SPACE SWITCH",
-            height=50,
-            backgroundColor=(0.2, 0.6, 0.3),
-            command=self._stage_run_all,
-            annotation="Run all 3 stages in sequence"
-        )
-        cmds.setParent("..")
-        cmds.setParent("..")
-        
-        # ===== FINALIZE =====
-        cmds.frameLayout(label="Finalize Phase", collapsable=False, marginWidth=5, marginHeight=5)
-        cmds.columnLayout(adjustableColumn=True)
-        
-        cmds.button(
-            label="BAKE SOURCES DOWN",
-            height=30,
-            backgroundColor=(0.7, 0.4, 0.2),
-            command=self._bake_sources_down,
-            annotation="Bake driven sources to clean keys, run Euler filter, and remove constraints."
-        )
-        cmds.setParent("..")
-        cmds.setParent("..")
-        
-        # ===== CLEANUP =====
-        cmds.frameLayout(label="Cleanup", collapsable=True, marginWidth=5, marginHeight=5)
-        cmds.rowLayout(numberOfColumns=2, adjustableColumn=True)
-        cmds.button(
-            label="Select Locators",
-            command=self._select_locators
-        )
-        cmds.button(
-            label="Delete All",
-            backgroundColor=(0.6, 0.3, 0.3),
-            command=self._cleanup_all
-        )
-        cmds.setParent("..")
-        cmds.setParent("..")
-        
-        cmds.setParent("..")  # main_layout
-        
-        # Show window
-        cmds.showWindow(self.window)
-    
-    # =========================================================================
-    # UI CALLBACKS
-    # =========================================================================
-    def _update_setting(self, key, value):
-        """Update a setting value."""
+    def update_s(self, key, value):
         self.settings[key] = value
-    
-
-    def _on_space_mode_change(self, mode, *args):
-        """Handle space mode change."""
-        self.settings["space_mode"] = mode
         
-        # Update UI interactions if needed
-        # (Target field logic is handled by validation in Stage 1)
-        pass
-
-        # Auto-populate Camera target
-        if mode == "camera":
-            panel = cmds.getPanel(withFocus=True)
-            if panel and "modelPanel" in panel:
-                cam = cmds.modelPanel(panel, query=True, camera=True)
-                if cam:
-                    # cam might be shape or transform, get transform
-                    if cmds.nodeType(cam) == "camera":
-                        cam = cmds.listRelatives(cam, parent=True)[0]
-                    cmds.textField(self.target_field, edit=True, text=cam)
-                    self.target_object = cam
-
-    
-    def _on_rotation_order_change(self, value):
-        """Handle rotation order menu change."""
-        order_index = ROTATION_ORDERS.index(value.lower())
-        self.settings["rotation_order"] = order_index
+    def set_space_mode(self, mode_str):
+        self.update_s("mode", mode_str)
         
-        # Update preview locator if exists
-        if self.preview_locator and cmds.objExists(self.preview_locator):
-            cmds.setAttr(f"{self.preview_locator}.rotateOrder", order_index)
-            
-    def _adj_scale(self, multiply=True, *args):
-        """Multiplicative scale adjustment for selected (or preview) locators."""
-        factor = cmds.floatField(self.scale_factor_field, query=True, value=True)
-        if factor <= 0:
-            cmds.warning("Scale factor must be positive.")
-            return
-
-        sel = cmds.ls(selection=True)
+        padded_title = f"SPACE MODE // {mode_str.upper()}".ljust(22, "\xA0")
+        self.p_mode.update_title(padded_title)
         
-        # If nothing selected, try to affect preview locator
-        if not sel and self.preview_locator and cmds.objExists(self.preview_locator):
-            target_objs = [self.preview_locator]
+        for btn in self.mode_btns.buttons():
+            is_active = btn.isChecked()
+            anim = btn._opacity_anim
+            anim.stop()
+            anim.setStartValue(btn.effect.opacity())
+            anim.setEndValue(1.0 if is_active else 0.3)
+            anim.start()
+
+    def trigger_rot_flash(self, idx=0, initial=False):
+        self.settings["rot_order"] = self.ui_rot_order.currentIndex()
+        self._rot_target_text = self.ui_rot_order.currentText()
+        
+        if initial:
+            self._rot_flash_step = 10 
+            self._rot_flash_tick()
         else:
-            target_objs = sel
+            self._rot_flash_step = 0
+            self._rot_flash_timer.start(40) # Rapid strobe
             
-        if not target_objs:
-             cmds.warning("Select locators/objects to scale.")
-             return
-
-        for obj in target_objs:
-            # Check if attributes are locked
-            if cmds.getAttr(f"{obj}.scaleX", lock=True):
-                continue
-                
-            # Logic: Multiply or Divide
-            if not multiply:
-                scale_mult = 1.0 / factor
-            else:
-                scale_mult = factor
-
-            # Usually users scale the 'localScale' attr on shape for locators to avoid transform scale issues.
-            # Let's check if it's a locator.
-            shapes = cmds.listRelatives(obj, shapes=True)
-            is_locator = False
-            if shapes:
-                if cmds.nodeType(shapes[0]) == "locator":
-                    is_locator = True
-                    
-            if is_locator:
-                # Scale the LOCAL scale attributes on the shape
-                shape = shapes[0]
-                sx = cmds.getAttr(f"{shape}.localScaleX")
-                sy = cmds.getAttr(f"{shape}.localScaleY")
-                sz = cmds.getAttr(f"{shape}.localScaleZ")
-                
-                new_s = max(0.001, sx * scale_mult)
-                
-                cmds.setAttr(f"{shape}.localScaleX", new_s)
-                cmds.setAttr(f"{shape}.localScaleY", new_s)
-                cmds.setAttr(f"{shape}.localScaleZ", new_s)
-            else:
-                # Standard transform scale
-                current_x = cmds.getAttr(f"{obj}.scaleX")
-                new_s = max(0.001, current_x * scale_mult)
-                cmds.scale(new_s, new_s, new_s, obj)
-                
-    def _on_color_select(self, color_name, *args):
-        """Handle color button click. Applies to SELECTION."""
-        color_index = LOCATOR_COLORS.get(color_name, 17)
-        self.settings["color_index"] = color_index
+    def _rot_flash_tick(self):
+        self._rot_flash_step += 1
+        html = ""
         
-        # Apply to selection
-        sel = cmds.ls(selection=True)
-        
-        # Also update preview locator if it exists and nothing selected, or if it is selected
-        if not sel and self.preview_locator and cmds.objExists(self.preview_locator):
-            sel = [self.preview_locator]
-            
-        if not sel:
-            cmds.inViewMessage(message=f"Color set to {color_name}. Select objects to apply.", pos="midCenter", fade=True)
-            return
-
-        for obj in sel:
-            shapes = cmds.listRelatives(obj, shapes=True)
-            if not shapes:
-                continue
-                
-            for shape in shapes:
-                cmds.setAttr(f"{shape}.overrideEnabled", 1)
-                cmds.setAttr(f"{shape}.overrideColor", color_index)
-    
-    def _pick_object(self, field_type, *args):
-        """Pick object from selection for source or target field."""
-        sel = cmds.ls(selection=True)
-        if not sel:
-            cmds.warning("Nothing selected to pick.")
-            return
-
-        if field_type == "source":
-            # Store ALL selected objects
-            self.source_objects = list(sel)
-            if len(sel) == 1:
-                display_text = sel[0]
-            elif len(sel) <= 3:
-                display_text = ", ".join(sel)
-            else:
-                display_text = f"{sel[0]} ... ({len(sel)} objects)"
-            cmds.textField(self.source_field, edit=True, text=display_text)
-        elif field_type == "target":
-            self.target_object = sel[0]
-            cmds.textField(self.target_field, edit=True, text=sel[0])
-            
-    def _create_preview_locator(self, *args):
-        """Create a preview locator to visualize settings."""
-        # Delete existing preview
-        if cmds.objExists("_SS_preview_locator"):
-            cmds.delete("_SS_preview_locator")
-        
-        # Determine position source
-        # Priority: Source Field -> Selection -> World Center
-        source_obj = cmds.textField(self.source_field, query=True, text=True)
-        if not source_obj or not cmds.objExists(source_obj):
-             sel = cmds.ls(selection=True)
-             if sel:
-                 source_obj = sel[0]
-        
-        # Create preview
-        loc = cmds.spaceLocator(name="_SS_preview_locator")[0]
-        self.preview_locator = loc
-        
-        # Apply current settings
-        size = self.settings["locator_size"]
-        cmds.setAttr(f"{loc}.localScaleX", size)
-        cmds.setAttr(f"{loc}.localScaleY", size)
-        cmds.setAttr(f"{loc}.localScaleZ", size)
-        
-        shape = cmds.listRelatives(loc, shapes=True)[0]
-        cmds.setAttr(f"{shape}.overrideEnabled", 1)
-        cmds.setAttr(f"{shape}.overrideColor", self.settings["color_index"])
-        
-        cmds.setAttr(f"{loc}.rotateOrder", self.settings["rotation_order"])
-        
-        cmds.setAttr(f"{loc}.rotateOrder", self.settings["rotation_order"])
-        
-        # Match to source if available
-        if source_obj and cmds.objExists(source_obj):
-            cmds.matchTransform(loc, source_obj, position=True, rotation=True)
-        
-        cmds.select(loc)
-    
-    # =========================================================================
-    # STAGE OPERATIONS
-    # =========================================================================
-    def _stage_create(self, *args):
-        """Stage 1: Create locator setup for all source objects."""
-        # Get source objects - use stored list, fallback to selection
-        objects_to_process = list(self.source_objects) if self.source_objects else []
-        
-        # Fallback to selection if source list is empty
-        if not objects_to_process:
-            sel = cmds.ls(selection=True)
-            if sel:
-                objects_to_process = list(sel)
-                self.source_objects = list(sel)
-                # Auto-populate field
-                if len(sel) == 1:
-                    display_text = sel[0]
-                elif len(sel) <= 3:
-                    display_text = ", ".join(sel)
+        if self._rot_flash_step <= 6:
+            # Flashing Sequence
+            is_white = (self._rot_flash_step % 2 == 1)
+            for char in self._rot_target_text:
+                if char == 'X':
+                    color = "#ffffff" if is_white else "#ff5555"
+                    html += f"<span style='color:{color};'>X</span>"
+                elif char == 'Y':
+                    color = "#ffffff" if is_white else "#55ff55"
+                    html += f"<span style='color:{color};'>Y</span>"
+                elif char == 'Z':
+                    color = "#ffffff" if is_white else "#55aaff"
+                    html += f"<span style='color:{color};'>Z</span>"
                 else:
-                    display_text = f"{sel[0]} ... ({len(sel)} objects)"
-                cmds.textField(self.source_field, edit=True, text=display_text)
-        
-        # Validate
-        objects_to_process = [obj for obj in objects_to_process if cmds.objExists(obj)]
-        if not objects_to_process:
-            cmds.warning("Please pick source object(s) or select objects.")
-            return False
-
-        print(f"Processing {len(objects_to_process)} source object(s): {objects_to_process}")
-        
-        # Delete preview locator
-        if cmds.objExists("_SS_preview_locator"):
-            cmds.delete("_SS_preview_locator")
-            self.preview_locator = None
-        
-        # Clear previous data
-        self.switcher = SpaceSwitcher()
-        
-        # Query UI state directly for robustness
-        effective_mode = self.settings.get("space_mode", "world")
-
-        # Validate target
-        if effective_mode in ["object", "camera", "aim"]:
-            target_obj_name = cmds.textField(self.target_field, query=True, text=True)
-            if not target_obj_name or not cmds.objExists(target_obj_name):
-                 cmds.warning(f"{effective_mode.title()} mode requires a valid Target object.")
-                 return False
-            self.target_object = target_obj_name
+                    html += char
+        else:
+            # Settle Sequence
+            self._rot_flash_timer.stop()
+            for char in self._rot_target_text:
+                if char == 'X': html += "<span style='color:#ff5555;'>X</span>"
+                elif char == 'Y': html += "<span style='color:#55ff55;'>Y</span>"
+                elif char == 'Z': html += "<span style='color:#55aaff;'>Z</span>"
+                else: html += char
                 
-                
-        for obj in objects_to_process:
-            
-            # Auto-detect best rotation order if enabled
-            rot_order = self.settings["rotation_order"]
-            if self.settings["auto_best_order"]:
-                start = cmds.playbackOptions(q=True, min=True)
-                end = cmds.playbackOptions(q=True, max=True)
-                best_order = self.switcher.get_best_rotation_order(obj, start, end)
-                if best_order is not None:
-                    rot_order = best_order
-                    # Update menu to reflect choice (optional, might be confusing if batching)
-                    # cmds.optionMenu(self.rot_order_menu, edit=True, select=best_order+1)
+        self.ui_rot_overlay.setText(html)
 
-            # Create locator hierarchy with MASTER logic
-            top_group, locator, master = self.switcher.create_locator_hierarchy(
-                source_obj=obj,
-                target_obj=self.target_object, # Pass strict target (or None)
-                mode=effective_mode,    # Pass mode so master constraints are built
-                num_offsets=self.settings["num_offsets"],
-                locator_size=self.settings["locator_size"],
-                color_index=self.settings["color_index"],
-                rotation_order=rot_order,
-                hide_offset=self.settings.get("hide_offset_locators", True)
-            )
-            
-            if not top_group:
-                 continue
+    def toggle_auto_detect(self, val):
+        self.settings["auto_detect"] = val
+        self.ui_rot_order.setEnabled(not val)
+        opacity = "0.5" if val else "1.0"
+        self.ui_rot_overlay.setStyleSheet(f"background: transparent; border: none; padding-left: 5px; opacity: {opacity};")
 
+    def adj_scale(self, delta):
+        val = max(0.1, self.ui_scale.value() + delta)
+        self.ui_scale.setValue(val)
+
+    def sync_offsets(self, val):
+        self.ui_offsets_lbl.setText(str(val))
+        self.settings["offsets"] = val
+
+    def set_color(self, name): 
+        self.settings["color"] = name
+        for n, btn in self.color_btns.items():
+            if n == name:
+                btn.setStyleSheet(f"background: {UI_COLORS[n]}; border: 1px solid white; opacity: 1.0;")
+            else:
+                btn.setStyleSheet(f"background: {UI_COLORS[n]}; border: none; opacity: 0.3;")
+
+        if self.preview_loc and cmds.objExists(self.preview_loc):
+            shape = cmds.listRelatives(self.preview_loc, shapes=True)[0]
+            cmds.setAttr(f"{shape}.overrideColor", LOCATOR_COLORS[name])
+
+    def pick_object(self, target_fld):
+        sel = cmds.ls(selection=True)
+        text_val = ", ".join(sel) if sel else ""
+        if target_fld == "source":
+            self.ui_source.set_cyber_text(text_val)
+        else:
+            self.ui_target.set_cyber_text(sel[0] if sel else "")
+
+    def create_preview(self):
+        if self.preview_loc and cmds.objExists(self.preview_loc):
+            cmds.delete(self.preview_loc)
             
-            # Create temporary constraints to TOP_GROUP for baking
-            # The MASTER above it is already constrained to the space
-            # So we just constrain top_group to Source to capture motion relative to Master
-            
-            self.switcher.create_temp_constraints(
-                obj, top_group,
-                translate=self.settings["translate"],
-                rotate=self.settings["rotate"]
-            )
-            
-            # Check for rig_layer
-            if cmds.objExists("rig_layer"):
-                cmds.editDisplayLayerMembers("rig_layer", master, noRecurse=True)
-            
-            # 4. Handle Display Layer
-            if self.settings["add_to_display_layer"]:
-                base_name = self._get_base_name(obj)
-                
-                # Create separate layers for Master and Offset with distinct names and colors
-                # Master -> Red (13), Offset -> Blue (6)
-                master_layer = f"{base_name}_Master_DL"
-                offset_layer = f"{base_name}_Offset_DL"
-                
-                self._add_to_display_layer([master], master_layer, color=13)
-                self._add_to_display_layer([locator, top_group], offset_layer, color=6)
+        self.preview_loc = cmds.spaceLocator(n="SS_Preview_Loc")[0]
+        s = self.settings["scale"]
+        cmds.setAttr(f"{self.preview_loc}.localScale", s, s, s)
         
-        # Select the created locators
-        top_groups = [data["top_group"] for data in self.switcher.created_locators]
-        cmds.select(top_groups)
+        shape = cmds.listRelatives(self.preview_loc, shapes=True)[0]
+        cmds.setAttr(f"{shape}.overrideEnabled", 1)
+        cmds.setAttr(f"{shape}.overrideColor", LOCATOR_COLORS[self.settings["color"]])
         
-        cmds.inViewMessage(
-            message=f"Created {len(top_groups)} locator setup(s). Ready for baking.",
-            pos="midCenter", fade=True
-        )
-        return True
-    
-    def _stage_bake(self, *args):
-        """Stage 2: Bake animation to locators."""
-        if not self.switcher.created_locators:
-            cmds.warning("No locators to bake. Run Stage 1 first.")
-            return False
+        src_text = self.ui_source.text()
+        if src_text and cmds.objExists(src_text.split(", ")[0]):
+            cmds.matchTransform(self.preview_loc, src_text.split(", ")[0], pos=True, rot=True)
+
+    def select_locators(self):
+        nodes = cmds.ls(f"*{LOCATOR_SUFFIX}", f"*{OFFSET_SUFFIX}*", "*_Master_Space")
+        if nodes:
+            cmds.select(nodes)
+        else:
+            cmds.warning("No Space Switch Locators found to select.")
+
+    # --- Core Actions ---
+    def run_full_action(self):
+        src_str = self.ui_source.text()
+        trg_str = self.ui_target.text()
         
-        sample_by    = self.settings["sample_by"]
-        euler_filter = self.settings["euler_filter"]
+        if not src_str:
+            cmds.warning("Please pick a Source object first!")
+            return
+            
+        sources = src_str.split(", ")
+        start = cmds.playbackOptions(q=True, min=True)
+        end = cmds.playbackOptions(q=True, max=True)
+        
+        self.btn_full.start_progress()
+        
+        for i, src in enumerate(sources):
+            if not cmds.objExists(src): continue
+            
+            base_p = float(i) / len(sources)
+            step = 1.0 / len(sources)
+            
+            short_src = src.split(':')[-1]
+            
+            self.btn_full.set_progress_blocking(base_p + step * 0.1, f"ANALYZING: {short_src}")
+            if self.settings["auto_detect"]:
+                best_order = self.logic.get_best_rotation_order(src, start, end)
+            else:
+                best_order = self.settings["rot_order"]
+            cmds.setAttr(f"{src}.rotateOrder", best_order)
+            
+            self.btn_full.set_progress_blocking(base_p + step * 0.3, f"BUILDING SETUP: {short_src}")
+            master, main_loc = self.logic.build_locator_setup(src, trg_str, self.settings)
+            
+            if self.settings["mode"] == "Object" and trg_str and cmds.objExists(trg_str):
+                cmds.parentConstraint(trg_str, master, mo=True)
+            
+            cmds.parentConstraint(src, main_loc, mo=False)
+            
+            self.btn_full.set_progress_blocking(base_p + step * 0.7, f"BAKING: {short_src}")
+            cmds.bakeResults(main_loc, t=(start, end), simulation=True, sampleBy=self.settings["sample_by"])
+            cmds.delete(main_loc, constraints=True)
+            
+            self.btn_full.set_progress_blocking(base_p + step * 0.9, f"CLEANING: {short_src}")
+            if self.settings["euler"]: cmds.filterCurve(f"{main_loc}_*")
+            if self.settings["clean_static"]: self.logic.clean_static_keys([main_loc], self.settings["threshold"])
 
-        # Group by base name (for per-object anim layer naming)
-        grouped_data = {}
-        for data in self.switcher.created_locators:
-            base = self._get_base_name(data["source"])
-            grouped_data.setdefault(base, []).append(data)
+            cmds.parentConstraint(main_loc, src, mo=False)
+            
+        self.btn_full.set_progress_blocking(1.0, "SYS.COMPLETE")
+        cmds.inViewMessage(amg="SPACE.SWITCH // SETUP COMPLETE", pos='midCenter', fade=True)
+        QtCore.QTimer.singleShot(800, self.btn_full.stop_progress)
 
-        # ── Phase 1: Bake ALL masters together (if enabled) ───────────────────
-        # All master constraints must stay live until ALL masters are baked.
-        if self.settings.get("bake_master_space", False):
-            all_masters = [d["master"] for d in self.switcher.created_locators]
-
-            if self.settings["bake_master_layer"]:
-                for base_name, data_list in grouped_data.items():
-                    grp_masters = [d["master"] for d in data_list]
-                    layer = self._get_or_create_anim_layer(f"{base_name}_Master_AL")
-                    if layer:
-                        cmds.select(grp_masters)
-                        cmds.animLayer(layer, edit=True, addSelectedObjects=True)
-
-            self.switcher.bake_animation(
-                all_masters,
-                sample_by=sample_by,
-                euler_filter=euler_filter,
-                cleanup_constraints=False,  # keep temp constraints live
-                destination_layer=None
-            )
-            # All masters baked -- now safe to release their constraints
-            for master in all_masters:
-                self.switcher._delete_constraints_on_node(master)
-
-        # ── Phase 2: Bake ALL top_groups in one single batch ──────────────────
-        # Collecting everything before calling bakeResults ensures every
-        # temp constraint is still live when the bake evaluates each frame.
-        all_top_groups = [d["top_group"] for d in self.switcher.created_locators]
-
-        if self.settings["bake_offset_layer"]:
-            for base_name, data_list in grouped_data.items():
-                grp_tops = [d["top_group"] for d in data_list]
-                layer = self._get_or_create_anim_layer(f"{base_name}_Offset_AL")
-                if layer:
-                    cmds.select(grp_tops)
-                    cmds.animLayer(layer, edit=True, addSelectedObjects=True)
-
-        # One bakeResults call for all top_groups -- constraints deleted after
-        self.switcher.bake_animation(
-            all_top_groups,
-            sample_by=sample_by,
-            euler_filter=euler_filter,
-            cleanup_constraints=True,  # delete all temp constraints after bake
-            destination_layer=None
-        )
-
-        # ── Phase 3: Per-group post-bake cleanup ──────────────────────────────
+    def bake_sources_down(self):
+        src_str = self.ui_source.text()
+        if not src_str: 
+            cmds.warning("No sources to bake down.")
+            return
+        
+        sources = [s for s in src_str.split(", ") if cmds.objExists(s)]
+        if not sources: return
+        
+        start = cmds.playbackOptions(q=True, min=True)
+        end = cmds.playbackOptions(q=True, max=True)
+        
+        self.btn_down.start_progress()
+        
+        self.btn_down.set_progress_blocking(0.2, "PREPARING SOURCES...")
+        self.btn_down.set_progress_blocking(0.5, "BAKING ANIMATIONS...")
+        
+        cmds.bakeResults(sources, t=(start, end), simulation=True, sampleBy=self.settings["sample_by"])
+        
+        self.btn_down.set_progress_blocking(0.7, "APPLYING FILTERS...")
+        if self.settings["euler"]:
+            for s in sources: cmds.filterCurve(f"{s}_*")
         if self.settings["clean_static"]:
-            for base_name, data_list in grouped_data.items():
-                self.switcher.cleanup_keys(
-                    [d["top_group"] for d in data_list],
-                    self.settings["static_threshold"]
-                )
-
-        locators = [d["locator"] for d in self.switcher.created_locators]
-        cmds.select(locators)
-        cmds.inViewMessage(
-            message=f"Baked {len(all_top_groups)} locator(s). Ready for adjustments.",
-            pos="midCenter", fade=True
-        )
-        return True
-    
-    def _stage_rebuild(self, *args):
-        """Stage 3: Apply locator -> source constraints. Sources are now driven by locators."""
-        if not self.switcher.created_locators:
-            cmds.warning("No locator data. Run Stage 1 and 2 first.")
-            return False
-        
-        # Apply constraints: locators drive sources (constraints are kept)
-        self.switcher.rebuild_constraints(
-            translate=self.settings["translate"],
-            rotate=self.settings["rotate"],
-            maintain_offset=False
-        )
-        
-        sources = [data["source"] for data in self.switcher.created_locators]
-        
-        cmds.select(sources)
-        cmds.inViewMessage(
-            message="Stage 3 complete. Sources are now driven by locators.",
-            pos="midCenter", fade=True
-        )
-        return True
-        
-    def _stage_run_all(self, *args):
-        """Run all stages in sequence. Sources end up with clean keys, identical positions."""
-        # Record the current frame to restore at the end
-        current_frame = cmds.currentTime(query=True)
-
-        if not self._stage_create():
-            return
-        
-        # Force a refresh to ensure Maya processes the creation
-        cmds.refresh()
-        
-        if not self._stage_bake():
-            return
+            self.logic.clean_static_keys(sources, self.settings["threshold"])
             
-        if not self._stage_rebuild():
-            return
+        self.btn_down.set_progress_blocking(0.9, "CLEANING RIG DATA...")
+        self.logic.cleanup()
         
-        # Return to the frame the user was on before baking
-        cmds.currentTime(current_frame)
-
-        # Select the baked offset locators (top_groups) — the animator's handles
-        if self.switcher.created_locators:
-            top_groups = [data["top_group"] for data in self.switcher.created_locators
-                          if cmds.objExists(data["top_group"])]
-            if top_groups:
-                cmds.select(top_groups)
-        
-        cmds.inViewMessage(
-            message="FULL SPACE SWITCH COMPLETE! Offset locators selected.",
-            pos="midCenter", fade=True, pivot=[0,0]
-        )
-
-    def _run_selected_stage(self, *args):
-        """Run the stage selected in the optionMenu."""
-        selection = cmds.optionMenu(self.stage_menu, query=True, value=True)
-        
-        if "STAGE 1" in selection:
-            self._stage_create()
-        elif "STAGE 2" in selection:
-            self._stage_bake()
-        elif "STAGE 3" in selection:
-            self._stage_rebuild()
-            
-    def _bake_sources_down(self, *args):
-        """Bake the actively driven sources back to normal keys and remove constraints."""
-        if not self.switcher.created_locators:
-            cmds.warning("No locator data. Run the Space Switch process first.")
-            return
-            
-        sources = [data["source"] for data in self.switcher.created_locators if cmds.objExists(data["source"])]
-        if not sources:
-            cmds.warning("No valid sources found to bake.")
-            return
-            
-        # Bake down the sources (which also applies the euler filter per global settings!)
-        self.switcher.bake_source_animation(
-            sources,
-            sample_by=self.settings["sample_by"],
-            euler_filter=self.settings["euler_filter"],
-            clean_static=self.settings["clean_static"],
-            threshold=self.settings["static_threshold"]
-        )
-        
-        # Release the constraints
-        for s in sources:
-            self.switcher._delete_constraints_on_node(s)
-            
-        cmds.select(sources)
-        cmds.inViewMessage(
-            message="Sources baked down and filtered successfully! Constraints removed.",
-            pos="midCenter", fade=True
-        )
-    
-    # =========================================================================
-    # CLEANUP
-    # =========================================================================
-    def _select_locators(self, *args):
-        """Select all created locators."""
-        if self.switcher.created_locators:
-            locators = [data["top_group"] for data in self.switcher.created_locators]
-            existing = [loc for loc in locators if cmds.objExists(loc)]
-            if existing:
-                cmds.select(existing)
-            else:
-                cmds.warning("No locators found in scene.")
-        else:
-            # Try to find by naming convention
-            all_locs = cmds.ls("*" + LOCATOR_SUFFIX, type="transform")
-            if all_locs:
-                cmds.select(all_locs)
-            else:
-                cmds.warning("No space switch locators found.")
-    
-    def _cleanup_all(self, *args):
-        """Delete all locators (constraints first to prevent pop)."""
-        
-        # Identify layers to delete based on the known locators
-        layers_to_delete = set()
-        
-        if self.switcher.created_locators:
-            for data in self.switcher.created_locators:
-                source = data["source"]
-                base_name = self._get_base_name(source)
-                
-                # Add potential layer names
-                layers_to_delete.add(f"{base_name}_Master_DL")
-                layers_to_delete.add(f"{base_name}_Offset_DL")
-                layers_to_delete.add(f"{base_name}_Master_AL")
-                layers_to_delete.add(f"{base_name}_Offset_AL")
-        
-        # Delete the layers if they exist
-        for layer in layers_to_delete:
-            if cmds.objExists(layer):
-                try:
-                    cmds.delete(layer)
-                except Exception as e:
-                    print(f"Could not delete layer {layer}: {e}")
-
-        self.switcher.cleanup(delete_constraints_first=True)
-        
-        # Also delete any preview locator
-        if cmds.objExists("_SS_preview_locator"):
-            cmds.delete("_SS_preview_locator")
-        
-        cmds.inViewMessage(
-            message="Cleanup complete. Layers, constraints, and locators deleted.",
-            pos="midCenter", fade=True
-        )
-
-    def _get_base_name(self, node_name):
-        """
-        Derive base name from node name.
-        Removes namespaces and '_CTL' suffix.
-        """
-        # Strip namespace
-        short_name = node_name.split(":")[-1].split("|")[-1]
-        
-        # Strip _CTL (case insensitive)
-        if short_name.lower().endswith("_ctl"):
-            base = short_name[:-4]
-        else:
-            base = short_name
-            
-        return base
-
-    def _add_to_display_layer(self, nodes, layer_name="SpaceSwitch_Layer", color=None):
-        """
-        Add nodes to a display layer, creating it if necessary.
-        
-        Args:
-            nodes: List of nodes to add
-            layer_name: Name of the layer
-            color: Optional color index (1-32) to set on the layer
-        """
-        if not cmds.objExists(layer_name):
-            cmds.createDisplayLayer(name=layer_name, empty=True)
-            # Make the layer visible and normal type
-            cmds.setAttr(f"{layer_name}.displayType", 0)
-            
-            if color is not None:
-                cmds.setAttr(f"{layer_name}.color", color)
-            
-        # Add members
-        cmds.editDisplayLayerMembers(layer_name, nodes, noRecurse=False)
-
-    def _get_or_create_anim_layer(self, layer_name):
-        """Get or create an animation layer."""
-        if not cmds.objExists(layer_name):
-            # Create anim layer
-            return cmds.animLayer(layer_name)
-        return layer_name
+        self.btn_down.set_progress_blocking(1.0, "BAKE.DOWN COMPLETE")
+        cmds.inViewMessage(amg="SPACE.SWITCH // BAKED & CLEANED", pos='midCenter', fade=True)
+        QtCore.QTimer.singleShot(800, self.btn_down.stop_progress)
 
 
-# ============================================================================
-# LAUNCH
-# ============================================================================
-# Global variable to hold the window instance and prevent GC
-_space_switch_ui_instance = None
+# ==============================================================================
+# ENTRY POINT
+# ==============================================================================
+_ss_window = None
 
 def show():
-    """Show the Space Switch Dashboard."""
-    global _space_switch_ui_instance
-    _space_switch_ui_instance = SpaceSwitchDashboard()
-    return _space_switch_ui_instance
+    global _ss_window
+    if _ss_window is not None:
+        try:
+            _ss_window.close()
+            _ss_window.deleteLater()
+        except Exception:
+            pass
+            
+    _ss_window = SpaceSwitchDashboard()
+    QtCore.QTimer.singleShot(0, _ss_window.optimize_space)
+    _ss_window.show()
 
-
-# Run on import/execute
 if __name__ == "__main__":
-    show()
-else:
     show()
