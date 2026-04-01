@@ -151,8 +151,8 @@ class SpaceSwitcher:
 
     
     def create_locator_hierarchy(self, source_obj, target_obj=None, mode="world", 
-                                  num_offsets=2, locator_size=18, 
-                                  color_index=17, rotation_order=0):
+                                  num_offsets=2, locator_size=1, 
+                                  color_index=17, rotation_order=0, hide_offset=True):
         """
         Create locator hierarchy with Master Space node.
         Hierarchy: Master(Space) -> Top_Offset(Baked) -> [Gimbal] -> Locator(Control)
@@ -214,6 +214,9 @@ class SpaceSwitcher:
         cmds.setAttr(f"{locator}.rotateOrder", rotation_order)
         # Expose rotateOrder in Channel Box
         cmds.setAttr(f"{locator}.rotateOrder", k=True)
+        # Hide the bottom child locator — it's a technical driver, not an animator handle
+        if hide_offset:
+            cmds.setAttr(f"{locator_shape}.visibility", 0)
         
         # Build offset hierarchy strictly above locator
         current_child = locator
@@ -240,6 +243,7 @@ class SpaceSwitcher:
                 shape = cmds.listRelatives(offset_grp, shapes=True)[0]
                 cmds.setAttr(f"{shape}.overrideEnabled", 1)
                 cmds.setAttr(f"{shape}.overrideColor", color_index)
+                # Top offset is the animator's baked control — keep it visible
             else:
                 offset_grp = cmds.group(empty=True, name=offset_name)
             
@@ -315,7 +319,7 @@ class SpaceSwitcher:
         self.temp_constraints.append(ac)
         return ac
     
-    def bake_animation(self, locators, sample_by=1, euler_filter=True, cleanup_constraints=True):
+    def bake_animation(self, locators, sample_by=1, euler_filter=True, cleanup_constraints=True, destination_layer=None):
         """
         Bake animation to locators.
         
@@ -324,6 +328,7 @@ class SpaceSwitcher:
             sample_by: Sample rate for baking
             euler_filter: Apply Euler filter after baking
             cleanup_constraints: Whether to delete temporary constraints
+            destination_layer: Name of animation layer to bake onto (optional)
         """
         if not locators:
             return
@@ -333,20 +338,24 @@ class SpaceSwitcher:
         
         cmds.refresh(suspend=True)
         try:
-            cmds.bakeResults(
-                locators,
-                simulation=True,
-                time=(start_time, end_time),
-                sampleBy=sample_by,
-                disableImplicitControl=True,
-                preserveOutsideKeys=True,
-                sparseAnimCurveBake=True,
-                removeBakedAttributeFromLayer=False,
-                removeBakedAnimFromLayer=False,
-                bakeOnOverrideLayer=False,
-                minimizeRotation=True,
-                controlPoints=False
-            )
+            bake_args = {
+                "simulation": True,
+                "time": (start_time, end_time),
+                "sampleBy": sample_by,
+                "disableImplicitControl": True,
+                "preserveOutsideKeys": True,
+                "sparseAnimCurveBake": True,
+                "removeBakedAttributeFromLayer": False,
+                "removeBakedAnimFromLayer": False,
+                "bakeOnOverrideLayer": False,
+                "minimizeRotation": True,
+                "controlPoints": False
+            }
+
+            if destination_layer:
+                bake_args["destinationLayer"] = destination_layer
+
+            cmds.bakeResults(locators, **bake_args)
             
             # Delete temporary constraints
             if cleanup_constraints:
@@ -467,6 +476,52 @@ class SpaceSwitcher:
             if rotate:
                 cmds.orientConstraint(locator, source, maintainOffset=maintain_offset)
     
+    def bake_source_animation(self, sources, sample_by=1, euler_filter=True, 
+                              clean_static=True, threshold=0.001):
+        """
+        Bake down the source objects' animation keys to capture their current 
+        motion (driven by locators), and perform cleanup to remove redundant 
+        or idle keys.
+        """
+        if not sources:
+            return
+            
+        valid_sources = [s for s in sources if cmds.objExists(s)]
+        if not valid_sources:
+            return
+
+        start_time = cmds.playbackOptions(query=True, minTime=True)
+        end_time   = cmds.playbackOptions(query=True, maxTime=True)
+
+        cmds.refresh(suspend=True)
+        try:
+            # Bake the sources based on what's driving them
+            cmds.bakeResults(
+                valid_sources,
+                simulation=True,
+                time=(start_time, end_time),
+                sampleBy=sample_by,
+                disableImplicitControl=True,
+                preserveOutsideKeys=True,
+                sparseAnimCurveBake=False,
+                minimizeRotation=True,
+                controlPoints=False
+            )
+            
+            # Apply Euler filter if requested
+            if euler_filter:
+                cmds.select(valid_sources)
+                cmds.filterCurve()
+                
+            # Clean static/redundant keys on the baked sources
+            if clean_static:
+                self.cleanup_keys(valid_sources, threshold)
+                
+        finally:
+            cmds.refresh(suspend=False)
+            
+        print(f"[SpaceSwitch] Baked and cleaned source animation for {len(valid_sources)} object(s).")
+    
     def cleanup(self, delete_constraints_first=True):
         """
         Clean up locators and constraints.
@@ -504,6 +559,47 @@ class SpaceSwitcher:
                 if cmds.objExists(c):
                     cmds.delete(c)
 
+    def bake_sources_from_constraints(self, sample_by=1, euler_filter=True):
+        """
+        After rebuild_constraints has been called, bake the source objects
+        back to clean keyframes from the locator constraints, then delete
+        those constraints. This leaves sources with world-space keys that
+        are identical to their original positions — no constraints remain.
+        """
+        sources = [d["source"] for d in self.created_locators
+                   if cmds.objExists(d["source"])]
+        if not sources:
+            return
+
+        start_time = cmds.playbackOptions(query=True, minTime=True)
+        end_time   = cmds.playbackOptions(query=True, maxTime=True)
+
+        cmds.refresh(suspend=True)
+        try:
+            cmds.bakeResults(
+                sources,
+                simulation=True,
+                time=(start_time, end_time),
+                sampleBy=sample_by,
+                disableImplicitControl=True,
+                preserveOutsideKeys=True,
+                sparseAnimCurveBake=False,
+                minimizeRotation=True,
+                controlPoints=False
+            )
+            # Delete the constraints we just baked from
+            for source in sources:
+                self._delete_constraints_on_node(source)
+
+            if euler_filter:
+                cmds.select(sources)
+                cmds.filterCurve()
+        finally:
+            cmds.refresh(suspend=False)
+
+        print(f"[SpaceSwitch] Baked and released {len(sources)} source(s). "
+              "Original motion preserved as clean keyframes.")
+
 
 # ============================================================================
 # DASHBOARD UI
@@ -515,14 +611,19 @@ class SpaceSwitchDashboard:
         self.switcher = SpaceSwitcher()
         self.preview_locator = None
         self.target_object = None
+        self.source_objects = []  # List of source objects for multi-source support
         self.settings = {
             "space_mode": "world",
             "translate": True,
             "rotate": True,
             "aim_at_target": False,
             "rotation_order": 0,
-            "locator_size": 18,
+            "locator_size": 1,
+            "hide_offset_locators": True,
             "bake_master_space": False,
+            "bake_master_layer": False,
+            "bake_offset_layer": False,
+            "add_to_display_layer": False,
             "num_offsets": 2,
             "color_index": 17,
             "sample_by": 1,
@@ -581,17 +682,20 @@ class SpaceSwitchDashboard:
         cmds.setParent("..")
         
         
-        # Source Field
+        # Source Field (supports multiple objects)
         cmds.rowLayout(numberOfColumns=3, adjustableColumn=2)
         cmds.text(label="Source: ", width=50)
-        self.source_field = cmds.textField(editable=False, width=180)
+        self.source_field = cmds.textField(editable=False, width=180,
+            annotation="Supports multiple objects. Use 'Pick' to load current selection.")
         cmds.button(label="Pick", width=50, command=partial(self._pick_object, "source"))
         cmds.setParent("..")
 
         # Auto-populate Source from selection on load
         sel = cmds.ls(selection=True)
         if sel:
-            cmds.textField(self.source_field, edit=True, text=sel[0])
+            self.source_objects = list(sel)
+            display_text = ", ".join(sel) if len(sel) <= 3 else f"{sel[0]} ... ({len(sel)} objects)"
+            cmds.textField(self.source_field, edit=True, text=display_text)
 
         # Target Field
         cmds.rowLayout(numberOfColumns=3, adjustableColumn=2)
@@ -647,24 +751,36 @@ class SpaceSwitchDashboard:
             backgroundColor=(0.3, 0.5, 0.3)
         )
         
-        cmds.rowLayout(numberOfColumns=3, adjustableColumn=3)
+        cmds.rowLayout(numberOfColumns=4, adjustableColumn=4, columnWidth4=[50, 40, 40, 60], columnAlign4=["left", "center", "center", "left"])
         cmds.text(label="Scale: ", width=50)
         cmds.button(
             label="-", width=40,
-            command=partial(self._adj_scale, -0.1)
+            command=partial(self._adj_scale, False),
+            annotation="Divide scale by factor"
         )
         cmds.button(
             label="+", width=40,
-            command=partial(self._adj_scale, 0.1)
+            command=partial(self._adj_scale, True),
+            annotation="Multiply scale by factor"
+        )
+        self.scale_factor_field = cmds.floatField(
+            value=1.5, precision=2, width=60,
+            annotation="Multiplication factor"
         )
         cmds.setParent("..")
         
-        cmds.rowLayout(numberOfColumns=2, adjustableColumn=2)
+        cmds.rowLayout(numberOfColumns=3, adjustableColumn=3)
         cmds.text(label="Offsets: ", width=50)
         self.offset_slider = cmds.intSliderGrp(
             field=True,
             minValue=1, maxValue=5, value=2,
             changeCommand=lambda x: self._update_setting("num_offsets", int(x))
+        )
+        cmds.checkBox(
+            label="Hide Offset",
+            value=True,
+            annotation="Hide offset locator shape by default.",
+            changeCommand=lambda x: self._update_setting("hide_offset_locators", x)
         )
         cmds.setParent("..")
         
@@ -692,6 +808,16 @@ class SpaceSwitchDashboard:
             )
         
         cmds.setParent("..")
+
+        cmds.rowLayout(numberOfColumns=2)
+        cmds.checkBox(
+            label="Add to Display Layer",
+            value=False,
+            annotation="Add offset locators to a display layer 'SpaceSwitch_Layer'.",
+            changeCommand=lambda x: self._update_setting("add_to_display_layer", x)
+        )
+        cmds.setParent("..")
+
         cmds.setParent("..")
         cmds.setParent("..")
         
@@ -733,33 +859,52 @@ class SpaceSwitchDashboard:
         )
         cmds.setParent("..")
         
+        cmds.rowLayout(numberOfColumns=2)
+        cmds.checkBox(
+            label="Bake Master to Anim Layer",
+            value=False,
+            annotation="If baking master space, put animation on 'Master_Space_AnimLayer'.",
+            changeCommand=lambda x: self._update_setting("bake_master_layer", x)
+        )
+        cmds.checkBox(
+            label="Bake Offset to Anim Layer",
+            value=False,
+            annotation="Put offset locator animation on 'Offset_AnimLayer'.",
+            changeCommand=lambda x: self._update_setting("bake_offset_layer", x)
+        )
+        cmds.setParent("..")
+
+        cmds.setParent("..")
+        
         cmds.setParent("..")
         cmds.setParent("..")
         
-        # ===== STAGE BUTTONS =====
+        # ===== STAGE DROPDOWN =====
         cmds.frameLayout(label="Workflow Stages", collapsable=False, marginWidth=5, marginHeight=5)
         cmds.columnLayout(adjustableColumn=True, rowSpacing=5)
         
-        cmds.button(
-            label="STAGE 1: Create Setup",
-            height=35,
-            backgroundColor=(0.3, 0.4, 0.5),
-            command=self._stage_create
-        )
-        cmds.button(
-            label="STAGE 2: Bake to Locators",
-            height=35,
-            backgroundColor=(0.4, 0.5, 0.3),
-            command=self._stage_bake
-        )
-        cmds.button(
-            label="STAGE 3: Rebuild Constraints",
-            height=35,
-            backgroundColor=(0.5, 0.4, 0.3),
-            command=self._stage_rebuild
-        )
+        cmds.rowLayout(numberOfColumns=2, adjustableColumn=1, columnWidth2=[200, 100])
+        self.stage_menu = cmds.optionMenu(label="")
+        cmds.menuItem(label="STAGE 1: Create Setup")
+        cmds.menuItem(label="STAGE 2: Bake to Locators")
+        cmds.menuItem(label="STAGE 3: Rebuild Constraints")
         
-        cmds.separator(height=10, style="none")
+        cmds.button(
+            label="RUN",
+            height=30,
+            backgroundColor=(0.3, 0.5, 0.4),
+            command=self._run_selected_stage,
+            annotation="Execute the selected stage"
+        )
+        cmds.setParent("..")
+        
+        cmds.setParent("..")
+        cmds.setParent("..")
+
+        # ===== FULL PROCESS =====
+        cmds.frameLayout(label="Main Action", collapsable=False, marginWidth=5, marginHeight=5)
+        cmds.columnLayout(adjustableColumn=True)
+        
         cmds.button(
             label="RUN FULL SPACE SWITCH",
             height=50,
@@ -767,7 +912,20 @@ class SpaceSwitchDashboard:
             command=self._stage_run_all,
             annotation="Run all 3 stages in sequence"
         )
+        cmds.setParent("..")
+        cmds.setParent("..")
         
+        # ===== FINALIZE =====
+        cmds.frameLayout(label="Finalize Phase", collapsable=False, marginWidth=5, marginHeight=5)
+        cmds.columnLayout(adjustableColumn=True)
+        
+        cmds.button(
+            label="BAKE SOURCES DOWN",
+            height=30,
+            backgroundColor=(0.7, 0.4, 0.2),
+            command=self._bake_sources_down,
+            annotation="Bake driven sources to clean keys, run Euler filter, and remove constraints."
+        )
         cmds.setParent("..")
         cmds.setParent("..")
         
@@ -829,8 +987,13 @@ class SpaceSwitchDashboard:
         if self.preview_locator and cmds.objExists(self.preview_locator):
             cmds.setAttr(f"{self.preview_locator}.rotateOrder", order_index)
             
-    def _adj_scale(self, amount, *args):
-        """Additive scale adjustment for selected (or preview) locators."""
+    def _adj_scale(self, multiply=True, *args):
+        """Multiplicative scale adjustment for selected (or preview) locators."""
+        factor = cmds.floatField(self.scale_factor_field, query=True, value=True)
+        if factor <= 0:
+            cmds.warning("Scale factor must be positive.")
+            return
+
         sel = cmds.ls(selection=True)
         
         # If nothing selected, try to affect preview locator
@@ -848,12 +1011,12 @@ class SpaceSwitchDashboard:
             if cmds.getAttr(f"{obj}.scaleX", lock=True):
                 continue
                 
-            current_x = cmds.getAttr(f"{obj}.scaleX")
-            current_y = cmds.getAttr(f"{obj}.scaleY")
-            current_z = cmds.getAttr(f"{obj}.scaleZ")
-            
-            # If it's a locator shape, we might be scaling localScale (like previous slider)
-            # But user asked for scaling transforms.
+            # Logic: Multiply or Divide
+            if not multiply:
+                scale_mult = 1.0 / factor
+            else:
+                scale_mult = factor
+
             # Usually users scale the 'localScale' attr on shape for locators to avoid transform scale issues.
             # Let's check if it's a locator.
             shapes = cmds.listRelatives(obj, shapes=True)
@@ -869,15 +1032,15 @@ class SpaceSwitchDashboard:
                 sy = cmds.getAttr(f"{shape}.localScaleY")
                 sz = cmds.getAttr(f"{shape}.localScaleZ")
                 
-                # Prevent negative scale?
-                new_s = max(0.1, sx + amount)
+                new_s = max(0.001, sx * scale_mult)
                 
                 cmds.setAttr(f"{shape}.localScaleX", new_s)
                 cmds.setAttr(f"{shape}.localScaleY", new_s)
                 cmds.setAttr(f"{shape}.localScaleZ", new_s)
             else:
                 # Standard transform scale
-                new_s = max(0.1, current_x + amount)
+                current_x = cmds.getAttr(f"{obj}.scaleX")
+                new_s = max(0.001, current_x * scale_mult)
                 cmds.scale(new_s, new_s, new_s, obj)
                 
     def _on_color_select(self, color_name, *args):
@@ -912,12 +1075,19 @@ class SpaceSwitchDashboard:
             cmds.warning("Nothing selected to pick.")
             return
 
-        obj = sel[0]
         if field_type == "source":
-            cmds.textField(self.source_field, edit=True, text=obj)
+            # Store ALL selected objects
+            self.source_objects = list(sel)
+            if len(sel) == 1:
+                display_text = sel[0]
+            elif len(sel) <= 3:
+                display_text = ", ".join(sel)
+            else:
+                display_text = f"{sel[0]} ... ({len(sel)} objects)"
+            cmds.textField(self.source_field, edit=True, text=display_text)
         elif field_type == "target":
-            self.target_object = obj
-            cmds.textField(self.target_field, edit=True, text=obj)
+            self.target_object = sel[0]
+            cmds.textField(self.target_field, edit=True, text=sel[0])
             
     def _create_preview_locator(self, *args):
         """Create a preview locator to visualize settings."""
@@ -961,25 +1131,32 @@ class SpaceSwitchDashboard:
     # STAGE OPERATIONS
     # =========================================================================
     def _stage_create(self, *args):
-        """Stage 1: Create locator setup."""
-        # Get source object
-        source_obj = cmds.textField(self.source_field, query=True, text=True)
+        """Stage 1: Create locator setup for all source objects."""
+        # Get source objects - use stored list, fallback to selection
+        objects_to_process = list(self.source_objects) if self.source_objects else []
         
-        # Fallback to selection if source field is empty
-        if not source_obj:
+        # Fallback to selection if source list is empty
+        if not objects_to_process:
             sel = cmds.ls(selection=True)
             if sel:
-                source_obj = sel[0]
+                objects_to_process = list(sel)
+                self.source_objects = list(sel)
                 # Auto-populate field
-                cmds.textField(self.source_field, edit=True, text=source_obj)
+                if len(sel) == 1:
+                    display_text = sel[0]
+                elif len(sel) <= 3:
+                    display_text = ", ".join(sel)
+                else:
+                    display_text = f"{sel[0]} ... ({len(sel)} objects)"
+                cmds.textField(self.source_field, edit=True, text=display_text)
         
-        if not source_obj or not cmds.objExists(source_obj):
-            cmds.warning("Please direct 'Source' to an object or select an object.")
+        # Validate
+        objects_to_process = [obj for obj in objects_to_process if cmds.objExists(obj)]
+        if not objects_to_process:
+            cmds.warning("Please pick source object(s) or select objects.")
             return False
 
-
-        # Prepare list
-        objects_to_process = [source_obj]
+        print(f"Processing {len(objects_to_process)} source object(s): {objects_to_process}")
         
         # Delete preview locator
         if cmds.objExists("_SS_preview_locator"):
@@ -1022,7 +1199,8 @@ class SpaceSwitchDashboard:
                 num_offsets=self.settings["num_offsets"],
                 locator_size=self.settings["locator_size"],
                 color_index=self.settings["color_index"],
-                rotation_order=rot_order
+                rotation_order=rot_order,
+                hide_offset=self.settings.get("hide_offset_locators", True)
             )
             
             if not top_group:
@@ -1042,6 +1220,18 @@ class SpaceSwitchDashboard:
             # Check for rig_layer
             if cmds.objExists("rig_layer"):
                 cmds.editDisplayLayerMembers("rig_layer", master, noRecurse=True)
+            
+            # 4. Handle Display Layer
+            if self.settings["add_to_display_layer"]:
+                base_name = self._get_base_name(obj)
+                
+                # Create separate layers for Master and Offset with distinct names and colors
+                # Master -> Red (13), Offset -> Blue (6)
+                master_layer = f"{base_name}_Master_DL"
+                offset_layer = f"{base_name}_Offset_DL"
+                
+                self._add_to_display_layer([master], master_layer, color=13)
+                self._add_to_display_layer([locator, top_group], offset_layer, color=6)
         
         # Select the created locators
         top_groups = [data["top_group"] for data in self.switcher.created_locators]
@@ -1059,53 +1249,84 @@ class SpaceSwitchDashboard:
             cmds.warning("No locators to bake. Run Stage 1 first.")
             return False
         
-        # Get settings
-        sample_by = self.settings["sample_by"]
+        sample_by    = self.settings["sample_by"]
         euler_filter = self.settings["euler_filter"]
 
-        # 1. OPTIONAL: Bake Master Space first
+        # Group by base name (for per-object anim layer naming)
+        grouped_data = {}
+        for data in self.switcher.created_locators:
+            base = self._get_base_name(data["source"])
+            grouped_data.setdefault(base, []).append(data)
+
+        # ── Phase 1: Bake ALL masters together (if enabled) ───────────────────
+        # All master constraints must stay live until ALL masters are baked.
         if self.settings.get("bake_master_space", False):
-            master_groups = [data["master"] for data in self.switcher.created_locators]
-            # Bake master groups, but KEEP temp constraints for the next step
+            all_masters = [d["master"] for d in self.switcher.created_locators]
+
+            if self.settings["bake_master_layer"]:
+                for base_name, data_list in grouped_data.items():
+                    grp_masters = [d["master"] for d in data_list]
+                    layer = self._get_or_create_anim_layer(f"{base_name}_Master_AL")
+                    if layer:
+                        cmds.select(grp_masters)
+                        cmds.animLayer(layer, edit=True, addSelectedObjects=True)
+
             self.switcher.bake_animation(
-                master_groups,
+                all_masters,
                 sample_by=sample_by,
                 euler_filter=euler_filter,
-                cleanup_constraints=False
+                cleanup_constraints=False,  # keep temp constraints live
+                destination_layer=None
             )
-            
-            # Delete constraints on master groups (free them from target)
-            for master in master_groups:
+            # All masters baked -- now safe to release their constraints
+            for master in all_masters:
                 self.switcher._delete_constraints_on_node(master)
 
-        # 2. Bake to TOP_GROUP (parent)
-        top_groups = [data["top_group"] for data in self.switcher.created_locators]
-        
+        # ── Phase 2: Bake ALL top_groups in one single batch ──────────────────
+        # Collecting everything before calling bakeResults ensures every
+        # temp constraint is still live when the bake evaluates each frame.
+        all_top_groups = [d["top_group"] for d in self.switcher.created_locators]
+
+        if self.settings["bake_offset_layer"]:
+            for base_name, data_list in grouped_data.items():
+                grp_tops = [d["top_group"] for d in data_list]
+                layer = self._get_or_create_anim_layer(f"{base_name}_Offset_AL")
+                if layer:
+                    cmds.select(grp_tops)
+                    cmds.animLayer(layer, edit=True, addSelectedObjects=True)
+
+        # One bakeResults call for all top_groups -- constraints deleted after
         self.switcher.bake_animation(
-            top_groups,
+            all_top_groups,
             sample_by=sample_by,
             euler_filter=euler_filter,
-            cleanup_constraints=True
+            cleanup_constraints=True,  # delete all temp constraints after bake
+            destination_layer=None
         )
-        
+
+        # ── Phase 3: Per-group post-bake cleanup ──────────────────────────────
         if self.settings["clean_static"]:
-            self.switcher.cleanup_keys(top_groups, self.settings["static_threshold"])
-        
-        # Select locators for animator to work with
-        locators = [data["locator"] for data in self.switcher.created_locators]
+            for base_name, data_list in grouped_data.items():
+                self.switcher.cleanup_keys(
+                    [d["top_group"] for d in data_list],
+                    self.settings["static_threshold"]
+                )
+
+        locators = [d["locator"] for d in self.switcher.created_locators]
         cmds.select(locators)
         cmds.inViewMessage(
-            message=f"Baked {len(top_groups)} top group(s). Locators ready for adjustments.",
+            message=f"Baked {len(all_top_groups)} locator(s). Ready for adjustments.",
             pos="midCenter", fade=True
         )
         return True
     
     def _stage_rebuild(self, *args):
-        """Stage 3: Rebuild constraints from locators to source."""
+        """Stage 3: Apply locator -> source constraints. Sources are now driven by locators."""
         if not self.switcher.created_locators:
             cmds.warning("No locator data. Run Stage 1 and 2 first.")
             return False
         
+        # Apply constraints: locators drive sources (constraints are kept)
         self.switcher.rebuild_constraints(
             translate=self.settings["translate"],
             rotate=self.settings["rotate"],
@@ -1113,15 +1334,19 @@ class SpaceSwitchDashboard:
         )
         
         sources = [data["source"] for data in self.switcher.created_locators]
+        
         cmds.select(sources)
         cmds.inViewMessage(
-            message="Constraints rebuilt! Space switch complete.",
+            message="Stage 3 complete. Sources are now driven by locators.",
             pos="midCenter", fade=True
         )
         return True
         
     def _stage_run_all(self, *args):
-        """Run all stages in sequence."""
+        """Run all stages in sequence. Sources end up with clean keys, identical positions."""
+        # Record the current frame to restore at the end
+        current_frame = cmds.currentTime(query=True)
+
         if not self._stage_create():
             return
         
@@ -1133,15 +1358,61 @@ class SpaceSwitchDashboard:
             
         if not self._stage_rebuild():
             return
-            
-        # Select the BAKED locators (offset locators)
+        
+        # Return to the frame the user was on before baking
+        cmds.currentTime(current_frame)
+
+        # Select the baked offset locators (top_groups) — the animator's handles
         if self.switcher.created_locators:
-            top_groups = [data["top_group"] for data in self.switcher.created_locators]
-            cmds.select(top_groups)
+            top_groups = [data["top_group"] for data in self.switcher.created_locators
+                          if cmds.objExists(data["top_group"])]
+            if top_groups:
+                cmds.select(top_groups)
         
         cmds.inViewMessage(
             message="FULL SPACE SWITCH COMPLETE! Offset locators selected.",
             pos="midCenter", fade=True, pivot=[0,0]
+        )
+
+    def _run_selected_stage(self, *args):
+        """Run the stage selected in the optionMenu."""
+        selection = cmds.optionMenu(self.stage_menu, query=True, value=True)
+        
+        if "STAGE 1" in selection:
+            self._stage_create()
+        elif "STAGE 2" in selection:
+            self._stage_bake()
+        elif "STAGE 3" in selection:
+            self._stage_rebuild()
+            
+    def _bake_sources_down(self, *args):
+        """Bake the actively driven sources back to normal keys and remove constraints."""
+        if not self.switcher.created_locators:
+            cmds.warning("No locator data. Run the Space Switch process first.")
+            return
+            
+        sources = [data["source"] for data in self.switcher.created_locators if cmds.objExists(data["source"])]
+        if not sources:
+            cmds.warning("No valid sources found to bake.")
+            return
+            
+        # Bake down the sources (which also applies the euler filter per global settings!)
+        self.switcher.bake_source_animation(
+            sources,
+            sample_by=self.settings["sample_by"],
+            euler_filter=self.settings["euler_filter"],
+            clean_static=self.settings["clean_static"],
+            threshold=self.settings["static_threshold"]
+        )
+        
+        # Release the constraints
+        for s in sources:
+            self.switcher._delete_constraints_on_node(s)
+            
+        cmds.select(sources)
+        cmds.inViewMessage(
+            message="Sources baked down and filtered successfully! Constraints removed.",
+            pos="midCenter", fade=True
         )
     
     # =========================================================================
@@ -1166,6 +1437,29 @@ class SpaceSwitchDashboard:
     
     def _cleanup_all(self, *args):
         """Delete all locators (constraints first to prevent pop)."""
+        
+        # Identify layers to delete based on the known locators
+        layers_to_delete = set()
+        
+        if self.switcher.created_locators:
+            for data in self.switcher.created_locators:
+                source = data["source"]
+                base_name = self._get_base_name(source)
+                
+                # Add potential layer names
+                layers_to_delete.add(f"{base_name}_Master_DL")
+                layers_to_delete.add(f"{base_name}_Offset_DL")
+                layers_to_delete.add(f"{base_name}_Master_AL")
+                layers_to_delete.add(f"{base_name}_Offset_AL")
+        
+        # Delete the layers if they exist
+        for layer in layers_to_delete:
+            if cmds.objExists(layer):
+                try:
+                    cmds.delete(layer)
+                except Exception as e:
+                    print(f"Could not delete layer {layer}: {e}")
+
         self.switcher.cleanup(delete_constraints_first=True)
         
         # Also delete any preview locator
@@ -1173,9 +1467,52 @@ class SpaceSwitchDashboard:
             cmds.delete("_SS_preview_locator")
         
         cmds.inViewMessage(
-            message="Cleanup complete. Constraints and locators deleted.",
+            message="Cleanup complete. Layers, constraints, and locators deleted.",
             pos="midCenter", fade=True
         )
+
+    def _get_base_name(self, node_name):
+        """
+        Derive base name from node name.
+        Removes namespaces and '_CTL' suffix.
+        """
+        # Strip namespace
+        short_name = node_name.split(":")[-1].split("|")[-1]
+        
+        # Strip _CTL (case insensitive)
+        if short_name.lower().endswith("_ctl"):
+            base = short_name[:-4]
+        else:
+            base = short_name
+            
+        return base
+
+    def _add_to_display_layer(self, nodes, layer_name="SpaceSwitch_Layer", color=None):
+        """
+        Add nodes to a display layer, creating it if necessary.
+        
+        Args:
+            nodes: List of nodes to add
+            layer_name: Name of the layer
+            color: Optional color index (1-32) to set on the layer
+        """
+        if not cmds.objExists(layer_name):
+            cmds.createDisplayLayer(name=layer_name, empty=True)
+            # Make the layer visible and normal type
+            cmds.setAttr(f"{layer_name}.displayType", 0)
+            
+            if color is not None:
+                cmds.setAttr(f"{layer_name}.color", color)
+            
+        # Add members
+        cmds.editDisplayLayerMembers(layer_name, nodes, noRecurse=False)
+
+    def _get_or_create_anim_layer(self, layer_name):
+        """Get or create an animation layer."""
+        if not cmds.objExists(layer_name):
+            # Create anim layer
+            return cmds.animLayer(layer_name)
+        return layer_name
 
 
 # ============================================================================
